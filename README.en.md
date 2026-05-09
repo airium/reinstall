@@ -1,147 +1,60 @@
 <!-- markdownlint-disable MD028 MD033 MD045 -->
 
-# reinstall
+[**中文版**](README.md)
 
-[![Codacy](https://img.shields.io/codacy/grade/dc679a17751448628fe6d8ac35e26eed?logo=Codacy&label=Codacy&style=flat-square)](https://app.codacy.com/gh/bin456789/reinstall/dashboard)
-[![CodeFactor](https://img.shields.io/codefactor/grade/github/bin456789/reinstall?logo=CodeFactor&logoColor=white&label=CodeFactor&style=flat-square)](https://www.codefactor.io/repository/github/bin456789/reinstall)
-[![Lines of Code](https://aschey.tech/tokei/github/bin456789/reinstall?category=code&label=Lines%20of%20Code&style=flat-square)](https://github.com/aschey/vercel-tokei)
-<!-- [![Lines of Code](https://tokei.rs/b1/github/bin456789/reinstall?category=code&label=Lines%20of%20Code&style=flat-square)](https://github.com/XAMPPRocky/tokei_rs) -->
+---
 
-One-Click system reinstallation script for VPS [中文](README.md)
+### Modified reinstall Script
 
-## Introduction
+See the original repository <https://github.com/bin456789/reinstall> for usage instructions.
 
-- One-click reinstallation to Linux: Supports 19 common distributions.
-- One-click reinstallation to Windows: Uses the official original ISO instead of custom images. The script can automatically fetch the ISO link and installs public cloud drivers like `VirtIO`.
-- Supports reinstallation in any direction, i.e., `Linux to Linux`, `Linux to Windows`, `Windows to Windows`, `Windows to Linux`
-- Automatically configures IP and intelligently sets it as static or dynamic. Supports `/32`, `/128`, `gateway outside subnet`, `IPv6 only`, `IPv4/IPv6 on different NIC`
-- Specially optimized for low-spec servers, requires less memory than the official netboot
-- Uses partition table ID to identify hard drives throughout the process, ensuring no wrong disk is written
-- Supports BIOS and EFI boot, and ARM Server
-- No homemades image included, all resources are obtained in real-time from mirror sites
+---
 
-If this helped you, you can buy me a milk tea.
-[![Donate](https://img.shields.io/badge/Donate-30363D?style=for-the-badge&logo=GitHub-Sponsors&logoColor=#EA4AAA)](https://github.com/sponsors/bin456789)
+#### Specifying Filesystem Type and Formatting Options
 
-[![Sponsors](https://raw.githubusercontent.com/bin456789/sponsors/refs/heads/master/sponsors.svg)](https://github.com/sponsors/bin456789)
+`--fs-type ...` specifies the root partition filesystem. Available values are `default|ext4|xfs`, with `default` as the default value, which preserves the distribution's default logic. XFS requires XFS v5 format, which in turn requires a minimum Linux 5.10 kernel, so it is only supported on newer distributions.
 
-### Feedback
-
-[![GitHub Issues](https://img.shields.io/badge/GitHub-%23121011.svg?style=for-the-badge&logo=github&logoColor=white)](https://github.com/bin456789/reinstall/issues)
-[![Telegram Group](https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/reinstall_os)
-
-## Quick Start
-
-- [Download](#download-current-system-is--linux)
-- [Feature 1. One-click reinstallation to Linux](#feature-1-install--linux)
-- [Feature 2. One-click DD Raw image to hard disk](#feature-2-dd-raw-image-to-hard-disk)
-- [Feature 3. One-click reboot to Alpine Live OS](#feature-3-reboot-to--alpine-live-os)
-- [Feature 4. One-click reboot to netboot.xyz](#feature-4-reboot-to--netbootxyz)
-- [Feature 5. One-click reinstallation to Windows](#feature-5-install--windows-iso)
-- [Cancel the reinstallation](#cancel-the-reinstallation)
-
-## System Requirements
-
-The original system can be any system listed in the table.
-
-The system requirements for the target system are as follows:
-
-| System                                                                                                                                                                                                                                                                                                                                                                 | Version                               | Memory    | Disk             |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- | --------- | ---------------- |
-| <img width="16" height="16" src="https://www.alpinelinux.org/alpine-logo.ico" /> Alpine                                                                                                                                                                                                                                                                                | 3.20, 3.21, 3.22, 3.23                | 256 MB    | 1 GB             |
-| <img width="16" height="16" src="https://www.debian.org/favicon.ico" /> Debian                                                                                                                                                                                                                                                                                         | 9, 10, 11, 12, 13                     | 256 MB    | 1 ~ 1.5 GB ^     |
-| <img width="16" height="16" src="https://github.com/bin456789/reinstall/assets/7548515/f74b3d5b-085f-4df3-bcc9-8a9bd80bb16d" /> Kali                                                                                                                                                                                                                                   | Rolling                               | 256 MB    | 1 ~ 1.5 GB ^     |
-| <img width="16" height="16" src="https://documentation.ubuntu.com/server/_static/favicon.png" /> Ubuntu                                                                                                                                                                                                                                                                | 18.04 LTS - 26.04 LTS                 | 512 MB \* | 2 GB             |
-| <img width="16" height="16" src="https://img.alicdn.com/imgextra/i1/O1CN01oJnJZg1yK4RzI4Rx2_!!6000000006559-2-tps-118-118.png" /> Anolis                                                                                                                                                                                                                               | 7, 8, 23                              | 512 MB \* | 5 GB             |
-| <img width="16" height="16" src="https://www.redhat.com/favicon.ico" /> RHEL &nbsp;<img width="16" height="16" src="https://almalinux.org/fav/favicon.ico" /> AlmaLinux &nbsp;<img width="16" height="16" src="https://rockylinux.org/favicon.png" /> Rocky &nbsp;<img width="16" height="16" src="https://www.oracle.com/asset/web/favicons/favicon-32.png" /> Oracle | 8, 9, 10                              | 512 MB \* | 5 GB             |
-| <img width="16" height="16" src="https://opencloudos.org/qq.ico" /> OpenCloudOS                                                                                                                                                                                                                                                                                        | 8, 9, Stream 23                       | 512 MB \* | 5 GB             |
-| <img width="16" height="16" src="https://www.centos.org/assets/icons/favicon.svg" /> CentOS Stream                                                                                                                                                                                                                                                                     | 9, 10                                 | 512 MB \* | 5 GB             |
-| <img width="16" height="16" src="https://fedoraproject.org/favicon.ico" /> Fedora                                                                                                                                                                                                                                                                                      | 43, 44                                | 512 MB \* | 5 GB             |
-| <img width="16" height="16" src="https://www.openeuler.org/favicon.ico" /> openEuler                                                                                                                                                                                                                                                                                   | 20.03 LTS - 24.03 LTS                 | 512 MB \* | 5 GB             |
-| <img width="16" height="16" src="https://static.opensuse.org/favicon.ico" /> openSUSE                                                                                                                                                                                                                                                                                  | Leap 15.6, 16.0, Tumbleweed (Rolling) | 512 MB \* | 5 GB             |
-| <img width="16" height="16" src="https://nixos.org/favicon.svg" /> NixOS                                                                                                                                                                                                                                                                                               | 25.11                                 | 512 MB    | 5 GB             |
-| <img width="16" height="16" src="https://archlinux.org/static/favicon.png" /> Arch                                                                                                                                                                                                                                                                                     | Rolling                               | 512 MB    | 5 GB             |
-| <img width="16" height="16" src="https://www.gentoo.org/assets/img/logo/gentoo-g.png" /> Gentoo                                                                                                                                                                                                                                                                        | Rolling                               | 512 MB    | 5 GB             |
-| <img width="16" height="16" src="https://aosc.io/distros/aosc-os.svg" /> AOSC OS                                                                                                                                                                                                                                                                                       | Rolling                               | 512 MB    | 5 GB             |
-| <img width="16" height="16" src="https://www.fnnas.com/favicon.ico" /> fnOS                                                                                                                                                                                                                                                                                            | 1                                     | 512 MB    | 8 GB             |
-| <img width="16" height="16" src="https://blogs.windows.com/wp-content/uploads/prod/2022/09/cropped-Windows11IconTransparent512-32x32.png" /> Windows (DD)                                                                                                                                                                                                              | Any                                   | 512 MB    | Depends on image |
-| <img width="16" height="16" src="https://blogs.windows.com/wp-content/uploads/prod/2022/09/cropped-Windows11IconTransparent512-32x32.png" /> Windows (ISO)                                                                                                                                                                                                             | Vista, 7, 8.x (Server 2008 - 2012 R2) | 512 MB    | 25 GB            |
-| <img width="16" height="16" src="https://blogs.windows.com/wp-content/uploads/prod/2022/09/cropped-Windows11IconTransparent512-32x32.png" /> Windows (ISO)                                                                                                                                                                                                             | 10, 11 (Server 2016 - 2025)           | 1 GB      | 25 GB            |
-
-\* Indicates installation using cloud images, not traditional network installation.
-
-^ Indicates requiring either 256 MB memory + 1.5 GB disk, or 512 MB memory + 1 GB disk
-
-> [!WARNING]
->
-> In theory it also supports dedicated servers and PCs
->
-> but if you can use IPMI or a USB drive, this script is not recommended.
-
-> [!WARNING]
->
-> ❌ This script does not support OpenVZ or LXC virtual machines.
->
-> Please use <https://github.com/LloydAsp/OsMutation> instead.
-
-## Download (Current system is <img width="20" height="20" src="https://www.kernel.org/theme/images/logos/favicon.png" /> Linux)
-
-For server outside China:
+`--fs-options ...` appends arguments to mkfs, applying only to the root partition, and must be used together with `--fs-type ext4|xfs`. It is only supported for installation methods where `trans.sh` directly runs mkfs on the root partition; using an unsupported installation method will result in an error.
 
 ```bash
-curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh || wget -O ${_##*/} $_
+curl -O https://raw.githubusercontent.com/airium/reinstall/support-fs-opt/reinstall.sh || wget -O ${_##*/} $_
+
+# Install Debian 13 using XFS filesystem
+bash reinstall.sh debian 13 --fs-type xfs
+# Install Ubuntu 24.04 using EXT4 filesystem with 128KB inode size
+bash reinstall.sh ubuntu 24.04 --fs-type ext4 --fs-options '-i 131072'
+# Install Ubuntu 26.04 using XFS filesystem with reflink and rmapbt disabled
+bash reinstall.sh ubuntu 26.04 --fs-type xfs --fs-options '-m reflink=0,rmapbt=0'
 ```
 
-For server inside China:
+> [!NOTE]
+> Currently only EXT4 and XFS are supported.
+>
+> XFS is only supported on Debian 11+, Ubuntu 22.04+, Anolis 8+, OpenCloudOS 9+, openEuler 22.03+, Oracle Cloud image templates, and rolling-release distributions that use mkfs.
+>
+> Installation is only supported on servers outside China, as no domestic script mirror sites have been deployed.
+
+---
+
+#### Installing with MDADM RAID
+
+`--raid-level ...` specifies the RAID level. Available values are `linear|0|1|5`.
+
+`--raid-disks ...` specifies which disks participate in the RAID array, separated by `,`.
 
 ```bash
-curl -O https://cnb.cool/bin456789/reinstall/-/git/raw/main/reinstall.sh || wget -O ${_##*/} $_
+curl -O https://raw.githubusercontent.com/airium/reinstall/support-mdadm-raid/reinstall.sh || wget -O ${_##*/} $_
+
+# Specify two disks by device path to build RAID 0 and install Ubuntu 26.04
+bash reinstall.sh ubuntu 26.04 --raid-level 0 --raid-disks /dev/sda,/dev/sdb
+# Specify two disks by ID to build RAID Linear and install Ubuntu 26.04
+bash reinstall.sh ubuntu 26.04 --raid-level linear --raid-disks 'virtio-5ee85skf9mo1e8c2d64l,virtio-2r1yvcr1g6tybooi9lm0'
+# Specify three disks by UUID to build RAID 5 and install Ubuntu 26.04
+bash reinstall.sh ubuntu 26.04 --raid-level 5 --raid-disks 'f2da2da2-3f55-4c46-a329-2e1f32528395,6095df47-96dc-434a-b400-18db8696f7e9,4689bcae-3ad4-4e5a-9363-2c38455c51e9'
 ```
 
-## Download (Current system is <img width="20" height="20" src="https://blogs.windows.com/wp-content/uploads/prod/2022/09/cropped-Windows11IconTransparent512-32x32.png" /> Windows)
-
-> [!IMPORTANT]
-> Before proceeding, please disable the 'Real-time protection' feature in `Windows Defender`. This feature may prevent `certutil` from downloading any files.
-
-<details>
-
-<summary>Resolving Script Download Issues on Windows 7</summary>
-
-Due to lack of support for TLS 1.2, SHA-256, or outdated root certificates, Windows Vista, 7, and Server 2008 (R2) may not be able to download scripts automatically. Manual downloading is required, as follows:
-
-Use Internet Explorer (enable TLS 1.2 in IE's advanced settings first) to download, or use Remote Desktop to save the following two files into the same directory:
-
-- <https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.bat>
-
-- <https://www.cygwin.com/setup-x86.exe>
-
-To use, run the downloaded `reinstall.bat`.
-
-</details>
-
-For server outside China:
-
-```batch
-certutil -urlcache -f -split https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.bat
-```
-
-For server inside China:
-
-```batch
-certutil -urlcache -f -split https://cnb.cool/bin456789/reinstall/-/git/raw/main/reinstall.bat
-```
-
-## Usage
-
-**All features** can be used on both Linux and Windows.
-
-- on Linux, run `bash reinstall.sh ...`
-- on Windows, first run `cmd`, then run `.\reinstall.bat ...`
-  - If the link in the parameter contains special characters, it should be enclosed in `""`, not `''`.
-
-### Feature 1: Install <img width="16" height="16" src="https://www.kernel.org/theme/images/logos/favicon.png" /> Linux
-
-> [!CAUTION]
+> [!NOTE]
+> Currently only Ubuntu is supported.
 >
 > This feature will erase **the entire hard disk** of the current system (including other partitions)!
 >
