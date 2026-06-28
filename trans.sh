@@ -84,22 +84,35 @@ is_run_from_locald() {
 }
 
 # reinstall.sh 有相同方法 add_community_repo_for_alpine
-add_community_repo() {
-    local ver mirror
+add_community_repo_to() {
+    local os_dir=$1
+    local repo_file release_file ver mirror
+
+    if [ "$os_dir" = / ]; then
+        repo_file=/etc/apk/repositories
+        release_file=/etc/alpine-release
+    else
+        repo_file=$os_dir/etc/apk/repositories
+        release_file=$os_dir/etc/alpine-release
+    fi
 
     # 先检查原来的 repo 是不是 edge 或者 latest-stable
-    if grep -q "^http.*/edge/main$" /etc/apk/repositories; then
+    if grep -q "^http.*/edge/main$" "$repo_file"; then
         ver=edge
-    elif grep -q "^http.*/latest-stable/main$" /etc/apk/repositories; then
+    elif grep -q "^http.*/latest-stable/main$" "$repo_file"; then
         ver=latest-stable
     else
-        ver=v$(cut -d. -f1,2 </etc/alpine-release)
+        ver=v$(cut -d. -f1,2 <"$release_file")
     fi
 
-    if ! grep -q "^http.*/$ver/community$" /etc/apk/repositories; then
-        mirror=$(grep '^http.*/main$' /etc/apk/repositories | sed 's,/[^/]*/main$,,' | head -1)
-        echo $mirror/$ver/community >>/etc/apk/repositories
+    if ! grep -q "^http.*/$ver/community$" "$repo_file"; then
+        mirror=$(grep '^http.*/main$' "$repo_file" | sed 's,/[^/]*/main$,,' | head -1)
+        echo $mirror/$ver/community >>"$repo_file"
     fi
+}
+
+add_community_repo() {
+    add_community_repo_to /
 }
 
 # 有时网络问题下载失败，导致脚本中断
@@ -255,13 +268,18 @@ remove_alpine_rootfs() {
 download_via_browser() {
     local url=$1
     local path=$2
+    local link_pattern=$3
 
     local os_dir=/os/alpine_for_browser
     mkdir_clear "$os_dir"
 
     # 安装 chromium-headless-shell npm 到硬盘，减少内存占用
     create_alpine_rootfs "$os_dir" true
-    apk add --root "$os_dir" chromium-headless-shell npm
+    add_community_repo_to "$os_dir"
+    if ! apk add --root "$os_dir" chromium-headless-shell npm; then
+        warn "chromium-headless-shell is unavailable, using chromium instead"
+        apk add --root "$os_dir" chromium npm
+    fi
 
     # 安装 playwright
     # shellcheck disable=SC2046
@@ -276,8 +294,13 @@ download_via_browser() {
     # 下载文件
     # shellcheck disable=SC2154
     wget "$confhome/download-via-browser.js" -O "$os_dir/work/download-via-browser.js"
-    retry 5 chroot "$os_dir" node /work/download-via-browser.js "$url" "/work/download_file"
-    cp "$os_dir/work/download_file" "$path"
+    if retry 5 chroot "$os_dir" node /work/download-via-browser.js "$url" "/work/download_file" "$link_pattern"; then
+        cp "$os_dir/work/download_file" "$path"
+    else
+        ret=$?
+        remove_alpine_rootfs "$os_dir"
+        return $ret
+    fi
 
     # 清理
     remove_alpine_rootfs "$os_dir"
@@ -7333,6 +7356,7 @@ EOF
         # %RHELScsi.DeviceDesc% = rhelscsi_inst, PCI\VEN_1AF4&DEV_1048&SUBSYS_11001AF4&REV_01
 
         local baseurl=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads
+        local download_virtio_by_browser=false
 
         case "$nt_ver" in
         6.0 | 6.1) $support_sha256 &&
@@ -7346,11 +7370,9 @@ EOF
             # https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/
             # 路径是网页，可能会弹出 anubis 验证
 
-            # https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/CHECKSUM
-            # 路径是文件，应该不会弹出 anubis 验证？
-            dir=$(wget --spider -S "$baseurl/stable-virtio/CHECKSUM" 2>&1 >/dev/null |
-                grep -E '^  Location: ' | grep -Ewo -m1 'archive-virtio/virtio-win-[^/]+')
-            # dir=stable-virtio
+            # stable-virtio 可能会弹出 anubis 验证，用浏览器下载直链
+            dir=stable-virtio
+            download_virtio_by_browser=true
             ;;
         esac
 
@@ -7369,7 +7391,11 @@ EOF
         fi
 
         if [ "$virtio_source" = iso ]; then
-            download $baseurl/$dir/virtio-win.iso $drv/virtio.iso $can_use_cn_mirror
+            if $download_virtio_by_browser; then
+                download_via_browser $baseurl/$dir/ $drv/virtio.iso '^virtio-win\.iso$'
+            else
+                download $baseurl/$dir/virtio-win.iso $drv/virtio.iso $can_use_cn_mirror
+            fi
             mkdir -p $drv/virtio
             mount -o ro $drv/virtio.iso $drv/virtio
 
@@ -7382,7 +7408,11 @@ EOF
             fi
         else
             apk add 7zip file
-            download $baseurl/$dir/virtio-win-gt-$arch_xdd.msi $drv/virtio.msi $can_use_cn_mirror
+            if $download_virtio_by_browser; then
+                download_via_browser $baseurl/$dir/ $drv/virtio.msi '^virtio-win-gt-'"$arch_xdd"'\.msi$'
+            else
+                download $baseurl/$dir/virtio-win-gt-$arch_xdd.msi $drv/virtio.msi $can_use_cn_mirror
+            fi
             match="FILE_*_${virtio_sys}_${arch}*"
             7z x $drv/virtio.msi -o$drv/virtio -i!$match -y -bb1
             (
