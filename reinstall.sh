@@ -6,9 +6,9 @@
 # alpine 默认没有 bash，因此 shebang 用 sh，再 exec 切换到 bash
 
 set -eE
-confhome=https://raw.githubusercontent.com/bin456789/reinstall/main
-confhome_cn=https://cnb.cool/bin456789/reinstall/-/git/raw/main
-# confhome_cn=https://www.ghproxy.cc/https://raw.githubusercontent.com/bin456789/reinstall/main
+confhome=https://raw.githubusercontent.com/airium/reinstall/main
+# confhome_cn=https://www.ghproxy.cc/https://raw.githubusercontent.com/airium/reinstall/main
+confhome_cn=https://openlist.hk21.airium.net/sd/reinstall
 
 # 用于判断 reinstall.sh 和 trans.sh 是否兼容
 SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0005
@@ -112,6 +112,12 @@ Usage: $reinstall_____ anolis      7|8|23
                        [--web-port    PORT]
                        [--frpc-config PATH]
 
+                       For Linux Only (Experimental):
+                       [--fs-type     default|ext4|xfs]
+                       [--fs-options  MKFS_OPTIONS]
+                       [--raid-level  linear|0|1|5]
+                       [--raid-disks  DISK[,DISK...]]
+
                        For Windows Only:
                        [--allow-ping]
                        [--rdp-port    PORT]
@@ -121,7 +127,7 @@ Usage: $reinstall_____ anolis      7|8|23
                        For Linux Only:
                        [--no-cloud-kernel]         (only for Debian/Ubuntu/Alpine)
 
-       Manual:         https://github.com/bin456789/reinstall
+Manual: https://github.com/airium/reinstall
 
 EOF
     exit 1
@@ -326,6 +332,680 @@ is_digit() {
 
 is_port_valid() {
     is_digit "$1" && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+is_linux_reinstall_target() {
+    case "$distro" in
+    dd | windows | netboot.xyz | reset) return 1 ;;
+    *) return ;;
+    esac
+}
+
+is_fs_args_set() {
+    [ "$fs_type_set" = 1 ] || [ -n "$fs_options" ]
+}
+
+is_raid_args_set() {
+    [ -n "$raid_level" ] || [ -n "$raid_disks" ]
+}
+
+is_fs_options_valid() {
+    local value=$1
+
+    [ -n "$value" ] || return 1
+    [[ "$value" != *$'\n'* ]] || return 1
+    [[ "$value" != *$'\r'* ]] || return 1
+
+    # 只允许安全字符，避免通过 cmdline/ash 执行时出现注入风险
+    [[ "$value" != *"'"* ]] || return 1
+    [[ "$value" != *'"'* ]] || return 1
+    [[ "$value" != *'`'* ]] || return 1
+    [[ "$value" != *'$'* ]] || return 1
+    [[ "$value" != *\\* ]] || return 1
+    grep -Eq '^[0-9A-Za-z[:space:]._,:=/+^%-]+$' <<<"$value"
+}
+
+is_fs_options_identity_safe() {
+    local fs_type=$1
+    local value=$2
+    local token options option
+
+    for token in $value; do
+        case "$token" in
+        *uuid=*)
+            return 1
+            ;;
+        -?*)
+            options=${token#-}
+            while [ -n "$options" ]; do
+                option=${options%"${options#?}"}
+                options=${options#?}
+                case "$option" in
+                L | U) return 1 ;;
+                esac
+
+                # Only options without arguments can precede another option
+                # in a short-option group.
+                case "$fs_type:$option" in
+                ext4:c | ext4:D | ext4:F | ext4:j | ext4:n | ext4:q | ext4:S | ext4:V | ext4:v | \
+                    xfs:f | xfs:K | xfs:N | xfs:q | xfs:V) ;;
+                *) break ;;
+                esac
+            done
+            ;;
+        esac
+    done
+}
+
+is_fs_topology_section_safe() {
+    local fs_type=$1
+    local section=$2
+    local section_options=${3#=}
+    local forbidden_option suboption
+
+    case "$fs_type:$section" in
+    ext4:J) forbidden_option=device ;;
+    xfs:d) forbidden_option=name ;;
+    xfs:l) forbidden_option=logdev ;;
+    xfs:r) forbidden_option=rtdev ;;
+    *) return ;;
+    esac
+
+    while [ -n "$section_options" ]; do
+        suboption=${section_options%%,*}
+        case "$suboption" in
+        "$forbidden_option"=*) return 1 ;;
+        esac
+        [ "$section_options" != "$suboption" ] || break
+        section_options=${section_options#*,}
+    done
+}
+
+is_fs_options_topology_safe() {
+    local fs_type=$1
+    local value=$2
+    local token options option section_options pending_section
+
+    for token in $value; do
+        if [ -n "$pending_section" ]; then
+            if ! is_fs_topology_section_safe "$fs_type" "$pending_section" "$token"; then
+                return 1
+            fi
+            pending_section=
+            case "$token" in
+            -?*) ;;
+            *) continue ;;
+            esac
+        fi
+
+        case "$token" in
+        -?*)
+            options=${token#-}
+            while [ -n "$options" ]; do
+                option=${options%"${options#?}"}
+                options=${options#?}
+                case "$fs_type:$option" in
+                ext4:z | xfs:c)
+                    # EXT4 undo files and XFS config files can name external storage.
+                    return 1
+                    ;;
+                ext4:J | xfs:d | xfs:l | xfs:r)
+                    section_options=${options#=}
+                    if [ -n "$section_options" ]; then
+                        if ! is_fs_topology_section_safe "$fs_type" "$option" "$section_options"; then
+                            return 1
+                        fi
+                    else
+                        pending_section=$option
+                    fi
+                    break
+                    ;;
+                # Only no-argument options may prefix a relevant option.
+                ext4:c | ext4:D | ext4:F | ext4:j | ext4:n | ext4:q | ext4:S | ext4:V | ext4:v | \
+                    xfs:f | xfs:K | xfs:N | xfs:q | xfs:V) ;;
+                *) break ;;
+                esac
+            done
+            ;;
+        esac
+    done
+}
+
+is_ext4_options_fstype_safe() {
+    local value=$1
+    local token options option
+
+    for token in $value; do
+        case "$token" in
+        -?*)
+            options=${token#-}
+            while [ -n "$options" ]; do
+                option=${options%"${options#?}"}
+                options=${options#?}
+                case "$option" in
+                t) return 1 ;;
+                # Short options without arguments can be grouped before -t.
+                c | D | F | j | n | q | S | V | v) ;;
+                *) break ;;
+                esac
+            done
+            ;;
+        esac
+    done
+}
+
+is_xfs_metadata_options_v5_safe() {
+    local metadata_options=${1#=}
+    local metadata_option
+
+    while [ -n "$metadata_options" ]; do
+        metadata_option=${metadata_options%%,*}
+        case "$metadata_option" in
+        crc=1) ;;
+        crc=*) return 1 ;;
+        esac
+        [ "$metadata_options" != "$metadata_option" ] || break
+        metadata_options=${metadata_options#*,}
+    done
+}
+
+is_xfs_options_v5_safe() {
+    local value=$1
+    local token options option metadata_options pending_metadata
+
+    for token in $value; do
+        if [ -n "$pending_metadata" ]; then
+            if ! is_xfs_metadata_options_v5_safe "$token"; then
+                return 1
+            fi
+            pending_metadata=
+            case "$token" in
+            -?*) ;;
+            *) continue ;;
+            esac
+        fi
+
+        case "$token" in
+        -?*)
+            options=${token#-}
+            while [ -n "$options" ]; do
+                option=${options%"${options#?}"}
+                options=${options#?}
+                case "$option" in
+                m)
+                    metadata_options=${options#=}
+                    if [ -n "$metadata_options" ]; then
+                        if ! is_xfs_metadata_options_v5_safe "$metadata_options"; then
+                            return 1
+                        fi
+                    else
+                        pending_metadata=1
+                    fi
+                    break
+                    ;;
+                f | K | N | q | V) ;;
+                *) break ;;
+                esac
+            done
+            ;;
+        esac
+    done
+}
+
+is_raid_disks_valid() {
+    local value=$1
+
+    [ -n "$value" ] || return 1
+    [[ "$value" != *[[:space:]]* ]] || return 1
+    [[ "$value" != ,* ]] || return 1
+    [[ "$value" != *, ]] || return 1
+    [[ "$value" != *,,* ]] || return 1
+    [[ "$value" != *"'"* ]] || return 1
+    [[ "$value" != *'"'* ]] || return 1
+    [[ "$value" != *'`'* ]] || return 1
+    [[ "$value" != *'$'* ]] || return 1
+    [[ "$value" != *\\* ]] || return 1
+    [[ "$value" != *';'* ]] || return 1
+    [[ "$value" != *'&'* ]] || return 1
+    [[ "$value" != *'|'* ]] || return 1
+    [[ "$value" != *'<'* ]] || return 1
+    [[ "$value" != *'>'* ]] || return 1
+    grep -Eq '^[0-9A-Za-z._,:=/+-]+$' <<<"$value"
+}
+
+is_raid_disk_path_whole_disk() {
+    local disk=${1##*/}
+
+    case "$disk" in
+    loop* | sr* | nbd* | md* | dm-* | zram* | ram*)
+        return 1
+        ;;
+    esac
+    [ -e "/sys/block/$disk" ]
+}
+
+is_initrd_compatible_raid_by_id_name() {
+    case "$1" in
+    *-part[0-9]* | dm-* | md-* | lvm-*) return 1 ;;
+    ata-* | mmc-* | nvme-* | virtio-* | wwn-0x*) return ;;
+    *) return 1 ;;
+    esac
+}
+
+is_disk_ptuuid_literal() {
+    [[ "$1" =~ ^[0-9A-Fa-f]{8}$ ]] ||
+        [[ "$1" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]
+}
+
+resolve_raid_disk_selector_for_host() {
+    local selector=$1
+    local path match count candidate candidate_ptuuid
+
+    case "$selector" in
+    /dev/disk/by-id/* | /dev/disk/by-path/*)
+        path=$(readlink -f "$selector" 2>/dev/null || true)
+        ;;
+    /dev/*)
+        path=$selector
+        ;;
+    *)
+        if [ -e "/dev/disk/by-id/$selector" ]; then
+            path=$(readlink -f "/dev/disk/by-id/$selector")
+        elif [ -e "/dev/disk/by-path/$selector" ]; then
+            path=$(readlink -f "/dev/disk/by-path/$selector")
+        elif is_disk_ptuuid_literal "$selector"; then
+            count=0
+            while IFS= read -r candidate; do
+                candidate_ptuuid=$(get_raid_disk_ptuuid_for_path "$candidate" || true)
+                if [ "$(to_lower <<<"$candidate_ptuuid")" = "$(to_lower <<<"$selector")" ]; then
+                    match=$candidate
+                    count=$((count + 1))
+                fi
+            done < <(get_host_raid_disk_paths)
+            if [ "$count" -gt 1 ]; then
+                error_and_exit "RAID disk PTUUID is not unique on this host: $selector"
+            fi
+            if [ "$count" -eq 1 ]; then
+                path=$match
+            fi
+        fi
+        ;;
+    esac
+
+    if [ -z "$path" ] || ! [ -b "$path" ]; then
+        error_and_exit "Could not resolve RAID disk before reboot: $selector"
+    fi
+    echo "$path"
+}
+
+get_raid_disk_ptuuid_for_path() {
+    local path=$1
+    local ptuuid
+
+    path=$(readlink -f "$path" 2>/dev/null || true)
+    if [ -z "$path" ] || ! [ -b "$path" ]; then
+        return 1
+    fi
+
+    # CentOS 7 lsblk/blkid do not expose PTUUID, so retain the fdisk fallback
+    # already used by find_main_disk.
+    install_pkg lsblk
+    ptuuid=$(lsblk --nodeps -rno PTUUID "$path" 2>/dev/null | head -n1)
+    if ! is_disk_ptuuid_literal "$ptuuid"; then
+        install_pkg fdisk
+        ptuuid=$(fdisk -l "$path" 2>/dev/null | get_disk_ptuuid_from_fdisk)
+    fi
+
+    if is_disk_ptuuid_literal "$ptuuid"; then
+        to_lower <<<"$ptuuid"
+    fi
+}
+
+get_disk_ptuuid_from_fdisk() {
+    awk '/^Disk identifier( \(GUID\))?:/ {print $NF; exit}' |
+        sed -e 's/^0x//' -e 's/[{}]//g'
+}
+
+get_host_raid_disk_paths() {
+    local path paths sys_path disk
+
+    install_pkg lsblk
+    if paths=$(lsblk --nodeps --paths -rno NAME 2>/dev/null); then
+        while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            is_raid_disk_path_whole_disk "$path" && echo "$path"
+        done <<<"$paths"
+        return 0
+    fi
+
+    for sys_path in /sys/block/*; do
+        [ -e "$sys_path" ] || continue
+        disk=${sys_path##*/}
+        path=/dev/$disk
+        [ -b "$path" ] || continue
+        is_raid_disk_path_whole_disk "$path" && echo "$path"
+    done
+    return 0
+}
+
+count_host_disks_with_ptuuid() {
+    local expected=$1
+    local path ptuuid count
+
+    expected=$(to_lower <<<"$expected")
+    count=0
+    while IFS= read -r path; do
+        ptuuid=$(get_raid_disk_ptuuid_for_path "$path" || true)
+        [ "$ptuuid" = "$expected" ] && count=$((count + 1))
+    done < <(get_host_raid_disk_paths)
+    echo "$count"
+}
+
+get_initrd_compatible_raid_by_id_for_path() {
+    local path=$1
+    local link target by_id
+
+    path=$(readlink -f "$path" 2>/dev/null || true)
+    if [ -z "$path" ] || ! [ -b "$path" ]; then
+        return 1
+    fi
+
+    if [ -d /dev/disk/by-id ]; then
+        for link in /dev/disk/by-id/*; do
+            [ -e "$link" ] || continue
+            by_id=${link##*/}
+            is_initrd_compatible_raid_by_id_name "$by_id" || continue
+            target=$(readlink -f "$link" 2>/dev/null || true)
+            if [ "$target" = "$path" ]; then
+                echo "$by_id"
+                return
+            fi
+        done
+    fi
+}
+
+normalize_raid_disks_for_reboot() {
+    local selector selector_name path stable normalized seen_stable seen_path
+    local i
+    local -a paths ptuuids by_ids
+
+    if ! is_raid_args_set; then
+        return
+    fi
+    if is_in_windows; then
+        normalized=
+        seen_stable=
+        IFS=, read -r -a raid_disk_array <<<"$raid_disks"
+        for selector in "${raid_disk_array[@]}"; do
+            case "$selector" in
+            /dev/disk/by-id/*)
+                selector_name=${selector##*/}
+                ;;
+            /dev/*)
+                error_and_exit "RAID /dev/... disk selectors can only be made stable when running from Linux. Use disk PTUUID or a stable by-id selector."
+                ;;
+            *)
+                selector_name=$selector
+                ;;
+            esac
+            if ! is_disk_ptuuid_literal "$selector_name" &&
+                ! is_initrd_compatible_raid_by_id_name "$selector_name"; then
+                error_and_exit "RAID disk selector is not a disk PTUUID or initrd-compatible by-id name: $selector"
+            fi
+            if is_disk_ptuuid_literal "$selector_name"; then
+                stable=$(to_lower <<<"$selector_name")
+            else
+                stable=$selector_name
+            fi
+            if grep -Fxq "$stable" <<<"$seen_stable"; then
+                error_and_exit "Duplicate stable RAID disk selector after normalization: $stable"
+            fi
+            [ -n "$normalized" ] && normalized+=,
+            normalized+="$stable"
+            seen_stable+="$stable"$'\n'
+        done
+        raid_disks=$normalized
+        return
+    fi
+
+    normalized=
+    seen_stable=
+    seen_path=
+    IFS=, read -r -a raid_disk_array <<<"$raid_disks"
+    for selector in "${raid_disk_array[@]}"; do
+        path=$(resolve_raid_disk_selector_for_host "$selector")
+        if ! is_raid_disk_path_whole_disk "$path"; then
+            error_and_exit "RAID disk selector is not a physical whole disk: $selector -> $path"
+        fi
+        if grep -Fxq "$path" <<<"$seen_path"; then
+            error_and_exit "Duplicate RAID disk after resolving: $selector -> $path"
+        fi
+        paths+=("$path")
+        ptuuids+=("$(get_raid_disk_ptuuid_for_path "$path" || true)")
+        by_ids+=("$(get_initrd_compatible_raid_by_id_for_path "$path" || true)")
+        seen_path+="$path"$'\n'
+    done
+
+    for i in "${!paths[@]}"; do
+        stable=
+        if [ -n "${ptuuids[i]}" ] &&
+            [ "$(count_host_disks_with_ptuuid "${ptuuids[i]}")" -eq 1 ]; then
+            stable=${ptuuids[i]}
+        fi
+        if [ -z "$stable" ]; then
+            stable=${by_ids[i]}
+        fi
+        if [ -z "$stable" ]; then
+            path=${paths[i]}
+            error_and_exit "RAID disk ${path##*/} has no unique disk PTUUID or initrd-compatible /dev/disk/by-id link. Use disks with unique PTUUIDs, or stable by-id selectors such as ata-*, nvme-*, virtio-*, wwn-0x*, or mmc-*."
+        fi
+        if grep -Fxq "$stable" <<<"$seen_stable"; then
+            error_and_exit "Duplicate stable RAID disk selector after resolving: $stable"
+        fi
+        [ -n "$normalized" ] && normalized+=,
+        normalized+="$stable"
+        seen_stable+="$stable"$'\n'
+    done
+
+    if [ "$normalized" != "$raid_disks" ]; then
+        info false "RAID disks resolved to stable selectors: $normalized"
+    fi
+    raid_disks=$normalized
+}
+
+get_install_fs_backend() {
+    if ! is_linux_reinstall_target; then
+        echo unsupported
+        return
+    fi
+
+    # debian/kali 传统安装走安装器分区流程；debian cloud image 走直接写盘流程
+    if is_distro_like_debian; then
+        if is_use_cloud_image; then
+            echo image
+        else
+            echo installer
+        fi
+        return
+    fi
+
+    if is_use_cloud_image; then
+        # 这几个系统云镜像通过复制文件 + mkfs 重建系统分区
+        case "$distro" in
+        centos | almalinux | rocky | oracle | redhat | anolis | opencloudos | openeuler | ubuntu)
+            echo mkfs
+            ;;
+        *)
+            # 其他云镜像通常直接 dd，不稳定支持重建文件系统
+            echo image
+            ;;
+        esac
+        return
+    fi
+
+    case "$distro" in
+    alpine | arch | gentoo | aosc | nixos | fnos) echo mkfs ;;
+    *) echo installer ;;
+    esac
+}
+
+verify_xfs_compatibility() {
+    local fs_backend=$1
+
+    # Linux 5.10 引入了 XFS v5 解决了 2038 年问题并标记 XFS v4 于 2030 年移除
+    # 因此只放行已知默认内核达到 5.10+ 的发行版/版本线
+    case "$distro:$releasever" in
+    centos:7)
+        error_and_exit "xfs is only supported on CentOS Stream 9+ in this script."
+        ;;
+    ubuntu:18.* | ubuntu:20.*)
+        error_and_exit "xfs is only supported on Ubuntu 22.04+ in this script."
+        ;;
+    debian:9 | debian:10)
+        error_and_exit "xfs is only supported on Debian 11+ in this script."
+        ;;
+    anolis:7)
+        error_and_exit "xfs is only supported on Anolis 8+ in this script."
+        ;;
+    opencloudos:8)
+        error_and_exit "xfs is only supported on OpenCloudOS 9+ in this script."
+        ;;
+    openeuler:20.03)
+        error_and_exit "xfs is only supported on openEuler 22.03+ in this script."
+        ;;
+    almalinux:8 | rocky:8)
+        error_and_exit "xfs is only supported on AlmaLinux/Rocky 9+ in this script."
+        ;;
+    fnos:*)
+        error_and_exit "xfs is not supported for fnos in this script."
+        ;;
+    esac
+
+    if [ "$fs_backend" = image ]; then
+        error_and_exit "xfs is not supported for image-based install path of $distro."
+    fi
+}
+
+verify_raid_args() {
+    local fs_backend disk_count min_disks disk seen_disks
+
+    if ! is_raid_args_set; then
+        return
+    fi
+
+    if [ -z "$raid_level" ] || [ -z "$raid_disks" ]; then
+        error_and_exit "--raid-level and --raid-disks must be used together."
+    fi
+
+    case "$raid_level" in
+    linear | 0 | 1 | 5) ;;
+    *) error_and_exit "Invalid --raid-level value: $raid_level" ;;
+    esac
+
+    case "$distro" in
+    ubuntu) ;;
+    *) error_and_exit "--raid-level/--raid-disks currently support Ubuntu cloud-image installs only." ;;
+    esac
+
+    if is_force_use_installer; then
+        error_and_exit "--raid-level/--raid-disks do not support --installer."
+    fi
+
+    fs_backend=$(get_install_fs_backend)
+    if [ "$fs_backend" != mkfs ] || ! is_use_cloud_image; then
+        error_and_exit "--raid-level/--raid-disks currently support Ubuntu cloud-image installs only. Do not use --installer."
+    fi
+
+    if [ "$target_disk_set" = 1 ]; then
+        error_and_exit "--raid-level/--raid-disks cannot be used together with --target-disk."
+    fi
+
+    IFS=, read -r -a raid_disk_array <<<"$raid_disks"
+    disk_count=${#raid_disk_array[@]}
+    case "$raid_level" in
+    5) min_disks=3 ;;
+    *) min_disks=2 ;;
+    esac
+    if [ "$disk_count" -lt "$min_disks" ]; then
+        error_and_exit "--raid-level $raid_level requires at least $min_disks disks."
+    fi
+
+    seen_disks=
+    for disk in "${raid_disk_array[@]}"; do
+        if [ -z "$disk" ]; then
+            error_and_exit "Invalid --raid-disks value: empty disk selector."
+        fi
+        if [[ "$disk" =~ ^/dev/(loop|sr|nbd|md|dm-|zram|ram) ]]; then
+            error_and_exit "--raid-disks must use physical whole disks, not virtual block devices: $disk"
+        fi
+        if [[ "$disk" =~ ^/dev/nvme[0-9]+n[0-9]+$ ]] || [[ "$disk" =~ ^/dev/mmcblk[0-9]+$ ]]; then
+            :
+        elif [[ "$disk" =~ ^/dev/[a-z]+[0-9]+$ ]] || [[ "$disk" =~ ^/dev/nvme[0-9]+n[0-9]+p[0-9]+$ ]] ||
+            [[ "$disk" =~ ^/dev/mmcblk[0-9]+p[0-9]+$ ]]; then
+            error_and_exit "--raid-disks must use whole disks, not partitions: $disk"
+        fi
+        if grep -Fxq "$disk" <<<"$seen_disks"; then
+            error_and_exit "Duplicate --raid-disks selector: $disk"
+        fi
+        seen_disks+="$disk"$'\n'
+    done
+}
+
+verify_fs_args() {
+    local fs_backend
+
+    if ! is_fs_args_set; then
+        return
+    fi
+
+    if ! is_linux_reinstall_target; then
+        error_and_exit "--fs-type/--fs-options are only supported for Linux reinstall targets."
+    fi
+
+    if [ -n "$fs_options" ] && [ "$fs_type_set" != 1 ]; then
+        error_and_exit "--fs-options requires explicit --fs-type ext4 or --fs-type xfs."
+    fi
+
+    fs_backend=$(get_install_fs_backend)
+
+    if [ "$fs_type_set" = 1 ]; then
+        case "$fs_type" in
+        default | ext4 | xfs) ;;
+        *) error_and_exit "Invalid --fs-type value: $fs_type" ;;
+        esac
+
+        if [ "$fs_type" != default ] && [ "$fs_backend" = image ]; then
+            error_and_exit "--fs-type is not supported for image-based install path of $distro."
+        fi
+
+        if [ "$fs_type" = xfs ]; then
+            verify_xfs_compatibility "$fs_backend"
+        fi
+    fi
+
+    if [ -n "$fs_options" ] && [ "$fs_type" = default ]; then
+        error_and_exit "--fs-options does not support --fs-type default. Please use --fs-type ext4 or --fs-type xfs."
+    fi
+
+    if [ -n "$fs_options" ] && ! is_fs_options_identity_safe "$fs_type" "$fs_options"; then
+        error_and_exit "--fs-options must not set filesystem label or UUID. The script preserves root filesystem identity for bootloader and fstab configuration."
+    fi
+
+    if [ -n "$fs_options" ] && ! is_fs_options_topology_safe "$fs_type" "$fs_options"; then
+        error_and_exit "--fs-options must not select external data, log, realtime, journal, or undo files, or load an XFS config file."
+    fi
+
+    if [ -n "$fs_options" ] && [ "$fs_type" = ext4 ] && ! is_ext4_options_fstype_safe "$fs_options"; then
+        error_and_exit "--fs-options must not override the ext4 filesystem type with -t."
+    fi
+
+    if [ -n "$fs_options" ] && [ "$fs_type" = xfs ] && ! is_xfs_options_v5_safe "$fs_options"; then
+        error_and_exit "--fs-options may set XFS crc only to crc=1. The script requires XFS v5 metadata."
+    fi
+
+    if [ -n "$fs_options" ] && [ "$fs_backend" != mkfs ]; then
+        error_and_exit "--fs-options is only supported when root filesystem is formatted directly by trans.sh."
+    fi
 }
 
 get_host_by_url() {
@@ -2913,7 +3593,7 @@ find_main_disk() {
 
         # 获取 xda 的 id
         install_pkg fdisk
-        main_disk=$(fdisk -l /dev/$xda | grep 'Disk identifier' | awk '{print $NF}' | sed 's/0x//')
+        main_disk=$(fdisk -l /dev/$xda | get_disk_ptuuid_from_fdisk)
     fi
 
     # 检查 id 格式是否正确
@@ -3545,7 +4225,7 @@ build_extra_cmdline() {
     # https://salsa.debian.org/installer-team/rootskel/-/blob/master/src/lib/debian-installer-startup.d/S02module-params?ref_type=heads
     for key in confhome hold force_boot_mode force_cn force_old_windows_setup cloud_image no_cloud_kernel no_auto_drivers main_disk \
         elts deb_mirror \
-        username ssh_port rdp_port web_port web_path allow_ping; do
+        username ssh_port rdp_port web_port web_path allow_ping fs_type; do
         value=${!key}
         if [ -n "$value" ]; then
             is_need_quote "$value" &&
@@ -3609,6 +4289,9 @@ build_nextos_cmdline() {
         if [ "$nextos_distro" = kali ]; then
             nextos_cmdline+=" net.ifnames=0"
             nextos_cmdline+=" simple-cdd/profiles=kali"
+        fi
+        if [ "$fs_type" = xfs ]; then
+            nextos_cmdline+=" partman/default_filesystem=xfs"
         fi
     elif is_distro_like_redhat $nextos_distro; then
         # redhat
@@ -3821,7 +4504,7 @@ partman-cros
 partman-iscsi
 partman-jfs
 partman-md
-partman-xfs
+$([ "$fs_type" != xfs ] && echo partman-xfs)
 rescue-check
 wpasupplicant-udeb
 lilo-installer
@@ -3838,7 +4521,7 @@ firewire-core-modules-$kver-di
 usb-storage-modules-$kver-di
 isofs-modules-$kver-di
 jfs-modules-$kver-di
-xfs-modules-$kver-di
+$([ "$fs_type" != xfs ] && echo xfs-modules-$kver-di)
 loop-modules-$kver-di
 pata-modules-$kver-di
 sata-modules-$kver-di
@@ -4371,6 +5054,20 @@ EOF
     fi
 }
 
+copy_or_download_conf_file() {
+    local name=$1
+    local dst=$2
+    local use_local=${3:-1}
+    local local_file
+
+    local_file=$(dirname "$THIS_SCRIPT")/$name
+    if [ "$use_local" = 1 ] && [ -f "$local_file" ]; then
+        cp "$local_file" "$dst"
+    else
+        curl -Lo "$dst" "$confhome/$name"
+    fi
+}
+
 mod_initrd() {
     info "mod $nextos_distro initrd"
     install_pkg gzip cpio
@@ -4396,14 +5093,14 @@ mod_initrd() {
     zcat /reinstall-initrd | cpio -idm \
         $(is_in_windows && echo --nonmatching 'dev/console' --nonmatching 'dev/null')
 
-    curl -Lo $initrd_dir/trans.sh $confhome/trans.sh
+    copy_or_download_conf_file trans.sh $initrd_dir/trans.sh
     if ! grep -iq "$SCRIPT_VERSION" $initrd_dir/trans.sh; then
         error_and_exit "
 This script is outdated, please download reinstall.sh again.
 脚本有更新，请重新下载 reinstall.sh"
     fi
 
-    curl -Lo $initrd_dir/initrd-network.sh $confhome/initrd-network.sh
+    copy_or_download_conf_file initrd-network.sh $initrd_dir/initrd-network.sh 0
     chmod a+x $initrd_dir/trans.sh $initrd_dir/initrd-network.sh
 
     # 保存配置
@@ -4415,6 +5112,18 @@ This script is outdated, please download reinstall.sh again.
     fi
     if [ -n "$frpc_config" ]; then
         cat "$frpc_config" >$initrd_dir/configs/frpc.conf
+    fi
+    if [ -n "$fs_type" ]; then
+        printf '%s\n' "$fs_type" >$initrd_dir/configs/fs_type
+    fi
+    if [ -n "$fs_options" ]; then
+        printf '%s\n' "$fs_options" >$initrd_dir/configs/fs_options
+    fi
+    if [ -n "$raid_level" ]; then
+        printf '%s\n' "$raid_level" >$initrd_dir/configs/raid_level
+    fi
+    if [ -n "$raid_disks" ]; then
+        printf '%s\n' "$raid_disks" >$initrd_dir/configs/raid_disks
     fi
 
     # 收集 cloud-data 打包进 initrd
@@ -4875,6 +5584,8 @@ long_opts=
 for o in ci installer debug minimal no-cloud-kernel no-auto-drivers allow-ping force-cn help \
     add-driver: \
     hold: sleep: \
+    fs-type: fs-options: \
+    raid-level: raid-disks: \
     iso: \
     image-name: \
     boot-wim: \
@@ -4975,6 +5686,40 @@ while true; do
     --no-auto-drivers)
         no_auto_drivers=1
         shift
+        ;;
+    --fs-type)
+        [ -n "$2" ] || error_and_exit "Need value for $1"
+        fs_type_set=1
+        fs_type=$(to_lower <<<"$2")
+        if ! { [ "$fs_type" = default ] || [ "$fs_type" = ext4 ] || [ "$fs_type" = xfs ]; }; then
+            error_and_exit "Invalid $1 value: $2"
+        fi
+        shift 2
+        ;;
+    --fs-options)
+        [ -n "$2" ] || error_and_exit "Need value for $1"
+        fs_options=$(sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//' <<<"$2")
+        if ! is_fs_options_valid "$fs_options"; then
+            error_and_exit "Invalid $1 value: $2"
+        fi
+        shift 2
+        ;;
+    --raid-level)
+        [ -n "$2" ] || error_and_exit "Need value for $1"
+        raid_level=$(to_lower <<<"$2")
+        case "$raid_level" in
+        linear | 0 | 1 | 5) ;;
+        *) error_and_exit "Invalid $1 value: $2" ;;
+        esac
+        shift 2
+        ;;
+    --raid-disks)
+        [ -n "$2" ] || error_and_exit "Need value for $1"
+        raid_disks=$(sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//' <<<"$2")
+        if ! is_raid_disks_valid "$raid_disks"; then
+            error_and_exit "Invalid $1 value: $2"
+        fi
+        shift 2
         ;;
     --allow-ping)
         allow_ping=1
@@ -5166,6 +5911,7 @@ EOF
         shift 2
         ;;
     --target-disk)
+        target_disk_set=1
         xda=${2##*/dev/}
         if ! [ -b "/dev/$xda" ]; then
             error_and_exit "Can't not find Disk $2."
@@ -5247,9 +5993,17 @@ redhat | centos | almalinux | rocky | fedora | ubuntu)
     ;;
 esac
 
+# RAID is cloud-image-only. Validate it before check_ram can fall back from an
+# explicitly requested installer to cloud-image mode.
+verify_raid_args
+
 # 检查内存
 # 会用到 wmic，因此要在设置国内 confhome 后使用
 check_ram
+
+# 文件系统参数依赖最终安装后端（installer/cloud-image/mkfs），需在模式归一化和内存回退后检查
+verify_fs_args
+normalize_raid_disks_for_reboot
 
 # 以下目标系统不需要两步安装
 # alpine
@@ -5619,11 +6373,19 @@ elif [ "$distro" = alpine ] && [ "$hold" = 1 ]; then
     echo "Or run \"$reinstall_____ reset\" now to clear this boot entry."
     echo
 else
-    warn false '警告：重装会清除主硬盘的所有数据，包括所有分区！'
+    if is_raid_args_set; then
+        warn false "警告：重装会清除所有 RAID 成员盘的全部数据，包括所有分区：$raid_disks"
+    else
+        warn false '警告：重装会清除主硬盘的所有数据，包括所有分区！'
+    fi
     echo '重启后开始重装。'
     echo "或者现在运行 \"$reinstall_____ reset\" 以取消重装。"
     echo
-    warn false 'Warning: Reinstalling will erase all data on the main disk, including all partitions!'
+    if is_raid_args_set; then
+        warn false "Warning: Reinstalling will erase all data on every RAID member disk, including all partitions: $raid_disks"
+    else
+        warn false 'Warning: Reinstalling will erase all data on the main disk, including all partitions!'
+    fi
     echo 'Reboot to start the reinstallation.'
     echo "Or run \"$reinstall_____ reset\" now to cancel the reinstallation."
 fi

@@ -408,6 +408,21 @@ is_use_cloud_image() {
     [ -n "$cloud_image" ] && [ "$cloud_image" = 1 ]
 }
 
+is_use_raid() {
+    [ -n "$raid_level" ] && [ -n "$raid_disks" ]
+}
+
+is_raid_root_size_grow_supported() {
+    case "$raid_level" in
+    1 | 5) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
+is_raid_args_set() {
+    [ -n "$raid_level" ] || [ -n "$raid_disks" ]
+}
+
 is_allow_ping() {
     [ -n "$allow_ping" ] && [ "$allow_ping" = 1 ]
 }
@@ -560,6 +575,266 @@ extract_env_from_cmdline() {
     web_port=${web_port:-80}
 }
 
+load_fs_config() {
+    if [ -f /configs/fs_type ]; then
+        fs_type=$(head -n1 /configs/fs_type | to_lower)
+    fi
+
+    if [ -f /configs/fs_options ]; then
+        fs_options=$(head -n1 /configs/fs_options)
+    fi
+}
+
+is_fs_options_identity_safe() {
+    local fs_type=$1
+    local value=$2
+    local token options option
+
+    for token in $value; do
+        case "$token" in
+        *uuid=*)
+            return 1
+            ;;
+        -?*)
+            options=${token#-}
+            while [ -n "$options" ]; do
+                option=${options%"${options#?}"}
+                options=${options#?}
+                case "$option" in
+                L | U) return 1 ;;
+                esac
+
+                # Only options without arguments can precede another option
+                # in a short-option group.
+                case "$fs_type:$option" in
+                ext4:c | ext4:D | ext4:F | ext4:j | ext4:n | ext4:q | ext4:S | ext4:V | ext4:v | \
+                    xfs:f | xfs:K | xfs:N | xfs:q | xfs:V) ;;
+                *) break ;;
+                esac
+            done
+            ;;
+        esac
+    done
+}
+
+is_fs_topology_section_safe() {
+    local fs_type=$1
+    local section=$2
+    local section_options=${3#=}
+    local forbidden_option suboption
+
+    case "$fs_type:$section" in
+    ext4:J) forbidden_option=device ;;
+    xfs:d) forbidden_option=name ;;
+    xfs:l) forbidden_option=logdev ;;
+    xfs:r) forbidden_option=rtdev ;;
+    *) return ;;
+    esac
+
+    while [ -n "$section_options" ]; do
+        suboption=${section_options%%,*}
+        case "$suboption" in
+        "$forbidden_option"=*) return 1 ;;
+        esac
+        [ "$section_options" != "$suboption" ] || break
+        section_options=${section_options#*,}
+    done
+}
+
+is_fs_options_topology_safe() {
+    local fs_type=$1
+    local value=$2
+    local token options option section_options pending_section
+
+    for token in $value; do
+        if [ -n "$pending_section" ]; then
+            if ! is_fs_topology_section_safe "$fs_type" "$pending_section" "$token"; then
+                return 1
+            fi
+            pending_section=
+            case "$token" in
+            -?*) ;;
+            *) continue ;;
+            esac
+        fi
+
+        case "$token" in
+        -?*)
+            options=${token#-}
+            while [ -n "$options" ]; do
+                option=${options%"${options#?}"}
+                options=${options#?}
+                case "$fs_type:$option" in
+                ext4:z | xfs:c)
+                    # EXT4 undo files and XFS config files can name external storage.
+                    return 1
+                    ;;
+                ext4:J | xfs:d | xfs:l | xfs:r)
+                    section_options=${options#=}
+                    if [ -n "$section_options" ]; then
+                        if ! is_fs_topology_section_safe "$fs_type" "$option" "$section_options"; then
+                            return 1
+                        fi
+                    else
+                        pending_section=$option
+                    fi
+                    break
+                    ;;
+                # Only no-argument options may prefix a relevant option.
+                ext4:c | ext4:D | ext4:F | ext4:j | ext4:n | ext4:q | ext4:S | ext4:V | ext4:v | \
+                    xfs:f | xfs:K | xfs:N | xfs:q | xfs:V) ;;
+                *) break ;;
+                esac
+            done
+            ;;
+        esac
+    done
+}
+
+is_ext4_options_fstype_safe() {
+    local value=$1
+    local token options option
+
+    for token in $value; do
+        case "$token" in
+        -?*)
+            options=${token#-}
+            while [ -n "$options" ]; do
+                option=${options%"${options#?}"}
+                options=${options#?}
+                case "$option" in
+                t) return 1 ;;
+                # Short options without arguments can be grouped before -t.
+                c | D | F | j | n | q | S | V | v) ;;
+                *) break ;;
+                esac
+            done
+            ;;
+        esac
+    done
+}
+
+is_xfs_metadata_options_v5_safe() {
+    local metadata_options=${1#=}
+    local metadata_option
+
+    while [ -n "$metadata_options" ]; do
+        metadata_option=${metadata_options%%,*}
+        case "$metadata_option" in
+        crc=1) ;;
+        crc=*) return 1 ;;
+        esac
+        [ "$metadata_options" != "$metadata_option" ] || break
+        metadata_options=${metadata_options#*,}
+    done
+}
+
+is_xfs_options_v5_safe() {
+    local value=$1
+    local token options option metadata_options pending_metadata
+
+    for token in $value; do
+        if [ -n "$pending_metadata" ]; then
+            if ! is_xfs_metadata_options_v5_safe "$token"; then
+                return 1
+            fi
+            pending_metadata=
+            case "$token" in
+            -?*) ;;
+            *) continue ;;
+            esac
+        fi
+
+        case "$token" in
+        -?*)
+            options=${token#-}
+            while [ -n "$options" ]; do
+                option=${options%"${options#?}"}
+                options=${options#?}
+                case "$option" in
+                m)
+                    metadata_options=${options#=}
+                    if [ -n "$metadata_options" ]; then
+                        if ! is_xfs_metadata_options_v5_safe "$metadata_options"; then
+                            return 1
+                        fi
+                    else
+                        pending_metadata=1
+                    fi
+                    break
+                    ;;
+                f | K | N | q | V) ;;
+                *) break ;;
+                esac
+            done
+            ;;
+        esac
+    done
+}
+
+verify_fs_runtime_config() {
+    case "$fs_type" in
+    '' | default | ext4 | xfs) ;;
+    *) error_and_exit "Invalid fs_type value: $fs_type" ;;
+    esac
+
+    if [ -z "$fs_options" ]; then
+        return
+    fi
+
+    case "$fs_type" in
+    ext4 | xfs) ;;
+    *) error_and_exit "--fs-options requires explicit fs_type ext4 or xfs." ;;
+    esac
+
+    if ! is_fs_options_identity_safe "$fs_type" "$fs_options"; then
+        error_and_exit "fs_options must not set filesystem label or UUID."
+    fi
+
+    if ! is_fs_options_topology_safe "$fs_type" "$fs_options"; then
+        error_and_exit "fs_options must not select external data, log, realtime, journal, or undo files, or load an XFS config file."
+    fi
+
+    if [ "$fs_type" = ext4 ] && ! is_ext4_options_fstype_safe "$fs_options"; then
+        error_and_exit "fs_options must not override the ext4 filesystem type with -t."
+    fi
+
+    if [ "$fs_type" = xfs ] && ! is_xfs_options_v5_safe "$fs_options"; then
+        error_and_exit "fs_options may set XFS crc only to crc=1. XFS v5 metadata is required."
+    fi
+}
+
+load_raid_config() {
+    if [ -f /configs/raid_level ]; then
+        raid_level=$(head -n1 /configs/raid_level | to_lower)
+    fi
+
+    if [ -f /configs/raid_disks ]; then
+        raid_disks=$(head -n1 /configs/raid_disks)
+    fi
+}
+
+verify_raid_runtime_config() {
+    if ! is_raid_args_set; then
+        return
+    fi
+
+    if [ -z "$raid_level" ] || [ -z "$raid_disks" ]; then
+        error_and_exit "--raid-level and --raid-disks must be used together."
+    fi
+
+    case "$raid_level" in
+    linear | 0 | 1 | 5) ;;
+    *) error_and_exit "Invalid RAID level: $raid_level" ;;
+    esac
+
+    case "$raid_disks" in
+    '' | ,* | *, | *,,* | *[!0-9A-Za-z._,:=/+-]*)
+        error_and_exit "Invalid RAID disk list: $raid_disks"
+        ;;
+    esac
+}
+
 ensure_service_started() {
     local service=$1
 
@@ -617,6 +892,19 @@ umount_all() {
     fi
 }
 
+stop_md_arrays() {
+    local md
+
+    if ! is_have_cmd mdadm; then
+        return
+    fi
+
+    for md in /dev/md/root /dev/md/boot /dev/md/* /dev/md[0-9]*; do
+        [ -e "$md" ] || continue
+        mdadm --stop "$md" 2>/dev/null || true
+    done
+}
+
 # 可能脚本不是首次运行，先清理之前的残留
 clear_previous() {
     if is_have_cmd vgchange; then
@@ -632,6 +920,7 @@ clear_previous() {
     rc-service -q --ifexists --ifstarted nix-daemon stop
     swapoff -a
     umount_all
+    stop_md_arrays
 
     # 以下情况 umount -R /1 会提示 busy
     # mount /file1 /1
@@ -1078,25 +1367,39 @@ grep_efi_index() {
 # 添加 bootx64.efi 到最后的话，会进入 EFI Shell
 # 因此添加到最前面
 add_default_efi_to_nvram() {
+    add_default_efi_to_nvram_for_disk() {
+        local disk=$1
+
+        if efi_row=$(lsblk "/dev/$disk" -ro NAME,PARTTYPE,PARTUUID | grep -i "$EFI_UUID"); then
+            efi_part_uuid=$(echo "$efi_row" | awk '{print $3}')
+            efi_part_name=$(echo "$efi_row" | awk '{print $1}')
+            efi_part_num=$(get_part_num_by_part "$efi_part_name")
+            efi_file=$(get_fallback_efi_file_name)
+
+            # 创建条目，先判断是否已经存在
+            # 好像没必要先判断
+            if true || ! efibootmgr | grep -i "HD($efi_part_num,GPT,$efi_part_uuid,.*)/File(\\\EFI\\\boot\\\\$efi_file)"; then
+                efibootmgr --create \
+                    --disk "/dev/$disk" \
+                    --part "$efi_part_num" \
+                    --label "$efi_file" \
+                    --loader "\\EFI\\boot\\$efi_file"
+            fi
+        else
+            return 1
+        fi
+    }
+
     info "add default EFI to nvram"
 
     apk add lsblk efibootmgr
 
-    if efi_row=$(lsblk /dev/$xda -ro NAME,PARTTYPE,PARTUUID | grep -i "$EFI_UUID"); then
-        efi_part_uuid=$(echo "$efi_row" | awk '{print $3}')
-        efi_part_name=$(echo "$efi_row" | awk '{print $1}')
-        efi_part_num=$(get_part_num_by_part "$efi_part_name")
-        efi_file=$(get_fallback_efi_file_name)
-
-        # 创建条目，先判断是否已经存在
-        # 好像没必要先判断
-        if true || ! efibootmgr | grep -i "HD($efi_part_num,GPT,$efi_part_uuid,.*)/File(\\\EFI\\\boot\\\\$efi_file)"; then
-            efibootmgr --create \
-                --disk "/dev/$xda" \
-                --part "$efi_part_num" \
-                --label "$efi_file" \
-                --loader "\\EFI\\boot\\$efi_file"
-        fi
+    if is_use_raid; then
+        for disk in $raid_disk_names; do
+            add_default_efi_to_nvram_for_disk "$disk"
+        done
+    elif add_default_efi_to_nvram_for_disk "$xda"; then
+        :
     else
         # shellcheck disable=SC2154
         if [ "$confirmed_no_efi" = 1 ]; then
@@ -1550,6 +1853,26 @@ EOF
     done
 }
 
+preload_alpine_lowram_fs_modules() {
+    local modules mod
+
+    if ! rc-service -q modloop status; then
+        return
+    fi
+
+    # xfs/ext4 may need crc32c after modloop is removed. On CPUs without SSE4.2,
+    # the crc32c alias may resolve to crc32c-intel and fail, so keep the generic fallback.
+    modprobe crc32c || modprobe crc32c-generic
+
+    modules=$(get_root_fs_type)
+    if is_efi; then
+        modules="$modules vfat nls_utf8 nls_cp437"
+    fi
+    for mod in $modules; do
+        modprobe "$mod"
+    done
+}
+
 install_alpine() {
     info "install alpine"
 
@@ -1565,15 +1888,7 @@ install_alpine() {
 
     if $hack_lowram; then
         # 预先加载需要的模块
-        if rc-service -q modloop status; then
-            modules="ext4 vfat nls_utf8 nls_cp437"
-            for mod in $modules; do
-                modprobe $mod
-            done
-            # crc32c 等于 crc32c-intel
-            # 没有 sse4.2 的机器加载 crc32c 时会报错 modprobe: ERROR: could not insert 'crc32c_intel': No such device
-            modprobe crc32c || modprobe crc32c-generic
-        fi
+        preload_alpine_lowram_fs_modules
 
         # 删除 modloop ，释放内存
         ensure_service_stopped modloop
@@ -2919,14 +3234,354 @@ xda() {
     fi
 }
 
+disk_part() {
+    local disk=$1
+    local part_num=$2
+
+    if is_ends_with_digit "$disk"; then
+        echo "${disk}p$part_num"
+    else
+        echo "${disk}$part_num"
+    fi
+}
+
+root_dev() {
+    if is_use_raid; then
+        echo /dev/md/root
+    else
+        echo "/dev/$(xda 2)"
+    fi
+}
+
+boot_dev() {
+    if is_use_raid; then
+        echo /dev/md/boot
+    else
+        echo ''
+    fi
+}
+
+efi_dev() {
+    local disk=${1:-$xda}
+    echo "/dev/$(disk_part "$disk" 1)"
+}
+
+installer_dev() {
+    if is_use_raid; then
+        echo "/dev/$(disk_part "$raid_installer_disk" 4)"
+    else
+        echo /dev/disk/by-label/installer
+    fi
+}
+
+raid_boot_parts() {
+    local disk
+    for disk in $raid_disk_names; do
+        echo "/dev/$(disk_part "$disk" 2)"
+    done
+}
+
+raid_root_parts() {
+    local disk
+    for disk in $raid_disk_names; do
+        echo "/dev/$(disk_part "$disk" 3)"
+    done
+}
+
+set_raid_part_arrays() {
+    local disk
+
+    raid_boot_part_array=
+    raid_root_part_array=
+    for disk in $raid_disk_names; do
+        raid_boot_part_array="$raid_boot_part_array /dev/$(disk_part "$disk" 2)"
+        raid_root_part_array="$raid_root_part_array /dev/$(disk_part "$disk" 3)"
+    done
+}
+
+update_part_disk() {
+    local disk=$1
+
+    sleep 1
+    sync
+
+    if is_have_cmd partprobe; then
+        partprobe "/dev/$disk" 2>/dev/null || true
+    fi
+
+    if is_have_cmd partx; then
+        partx -u "/dev/$disk" || true
+    fi
+}
+
+update_part_raid_disks() {
+    local disk
+
+    for disk in $raid_disk_names; do
+        update_part_disk "$disk"
+    done
+
+    ensure_service_stopped mdev
+    retry 5 rm -rf /dev/disk/*
+    mdev -sf 2>/dev/null
+    ensure_service_started mdev 2>/dev/null
+    sleep 1
+}
+
+refresh_raid_arrays() {
+    if ! is_use_raid; then
+        return
+    fi
+
+    stop_md_arrays
+    mkdir -p /dev/md
+    set_raid_part_arrays
+    # shellcheck disable=SC2086
+    mdadm --assemble --run /dev/md/boot $raid_boot_part_array
+    # shellcheck disable=SC2086
+    mdadm --assemble --run /dev/md/root $raid_root_part_array
+}
+
+verify_raid_disk_count() {
+    local disk_names=$1
+    local disk_count min_disks
+
+    disk_count=$(echo "$disk_names" | wc -w)
+    case "$raid_level" in
+    5) min_disks=3 ;;
+    *) min_disks=2 ;;
+    esac
+    if [ "$disk_count" -lt "$min_disks" ]; then
+        error_and_exit "--raid-level $raid_level requires at least $min_disks disks."
+    fi
+}
+
+resolve_raid_disk_selector() {
+    local selector=$1
+    local path disk matches match_count
+
+    case "$selector" in
+    /dev/disk/by-id/* | /dev/disk/by-path/*)
+        path=$(readlink -f "$selector" 2>/dev/null || true)
+        ;;
+    /dev/*)
+        path=$selector
+        ;;
+    *)
+        if [ -e "/dev/disk/by-id/$selector" ]; then
+            path=$(readlink -f "/dev/disk/by-id/$selector")
+        elif [ -e "/dev/disk/by-path/$selector" ]; then
+            path=$(readlink -f "/dev/disk/by-path/$selector")
+        else
+            matches=$(lsblk --nodeps -rno NAME,PTUUID |
+                awk -v id="$selector" 'tolower($2)==tolower(id) {print "/dev/"$1}')
+            match_count=$(printf '%s\n' "$matches" | grep -c . || true)
+            if [ "$match_count" -gt 1 ]; then
+                error_and_exit "RAID disk PTUUID is not unique in the install environment: $selector"
+            fi
+            if [ "$match_count" -eq 1 ]; then
+                path=$matches
+            fi
+        fi
+        ;;
+    esac
+
+    if [ -z "$path" ] || ! [ -b "$path" ]; then
+        error_and_exit "Could not resolve RAID disk: $selector"
+    fi
+
+    disk=${path##*/}
+    case "$disk" in
+    loop* | sr* | nbd* | md* | dm-* | zram* | ram*)
+        error_and_exit "RAID disk selector resolved to unsupported virtual block device: $selector -> $path"
+        ;;
+    esac
+    if ! [ -e "/sys/block/$disk" ]; then
+        error_and_exit "RAID disk selector is not a whole disk: $selector -> $path"
+    fi
+
+    echo "$disk"
+}
+
+resolve_raid_disks() {
+    local selector disk seen_disks
+
+    if ! is_use_raid; then
+        return
+    fi
+
+    verify_raid_runtime_config
+
+    if [ "$distro" != ubuntu ] || ! is_use_cloud_image; then
+        error_and_exit "RAID install currently supports Ubuntu cloud-image installs only."
+    fi
+
+    if raid_disk_names=$(get_config raid_disk_names 2>/dev/null) && [ -n "$raid_disk_names" ]; then
+        xda=$(printf '%s\n' "$raid_disk_names" | awk '{print $1}')
+        raid_installer_disk=$(get_config raid_installer_disk 2>/dev/null || true)
+        raid_installer_disk=${raid_installer_disk:-$xda}
+        verify_raid_disk_count "$raid_disk_names"
+        set_config xda "$xda"
+        return
+    fi
+
+    apk add lsblk
+    seen_disks=
+    for selector in $(echo "$raid_disks" | tr ',' ' '); do
+        disk=$(resolve_raid_disk_selector "$selector")
+        if printf '%s\n' "$seen_disks" | grep -Fxq "$disk"; then
+            error_and_exit "Duplicate RAID disk after resolving: $selector -> $disk"
+        fi
+        if [ -n "$seen_disks" ]; then
+            seen_disks="$seen_disks "
+        fi
+        seen_disks="$seen_disks$disk"
+    done
+
+    raid_disk_names=$seen_disks
+    verify_raid_disk_count "$raid_disk_names"
+    xda=$(printf '%s\n' "$raid_disk_names" | awk '{print $1}')
+    raid_installer_disk=$xda
+    set_config raid_disk_names "$raid_disk_names"
+    set_config raid_installer_disk "$raid_installer_disk"
+    set_config xda "$xda"
+}
+
+get_usable_rescue_disk() {
+    local disk saved_xda saved_installer_disk saved_raid_disks
+
+    saved_xda=$(get_config xda 2>/dev/null || true)
+    saved_installer_disk=$(get_config raid_installer_disk 2>/dev/null || true)
+    saved_raid_disks=$(get_config raid_disk_names 2>/dev/null || true)
+
+    for disk in "$xda" "$saved_xda" "$saved_installer_disk" $saved_raid_disks; do
+        if [ -n "$disk" ] && [ -b "/dev/$disk" ]; then
+            echo "$disk"
+            return
+        fi
+    done
+
+    return 1
+}
+
+get_root_fs_type() {
+    if [ -n "$fs_type" ] && [ "$fs_type" != default ]; then
+        echo "$fs_type"
+    else
+        echo ext4
+    fi
+}
+
+format_root_partition() {
+    local part=$1
+    local label=$2
+    local ext4_compat_opts=$3
+    local root_fs
+
+    root_fs=$(get_root_fs_type)
+    info false "format root: $part ($root_fs)"
+
+    # shellcheck disable=SC2086
+    case "$root_fs" in
+    ext4)
+        if [ -n "$label" ]; then
+            mkfs.ext4 -F $fs_options $ext4_compat_opts -L "$label" "$part"
+        else
+            mkfs.ext4 -F $fs_options $ext4_compat_opts "$part"
+        fi
+        ;;
+    xfs)
+        if [ -n "$label" ]; then
+            mkfs.xfs -f $fs_options -L "$label" "$part"
+        else
+            mkfs.xfs -f $fs_options "$part"
+        fi
+        ;;
+    *)
+        error_and_exit "Unsupported root fs type: $root_fs"
+        ;;
+    esac
+}
+
+create_ubuntu_raid_part() {
+    local disk fs installer_part_size boot_part_size
+
+    info "Create Ubuntu RAID Part"
+
+    installer_part_size="$(get_cloud_image_part_size)"
+    boot_part_size=1024MiB
+    fs=$(get_root_fs_type)
+
+    apk add parted e2fsprogs dosfstools mdadm wipefs
+    if [ "$fs_type" = xfs ]; then
+        apk add xfsprogs
+    fi
+
+    for disk in $raid_disk_names; do
+        wipefs -a -f "/dev/$disk"
+    done
+
+    for disk in $raid_disk_names; do
+        if is_efi; then
+            parted "/dev/$disk" -s -- \
+                mklabel gpt \
+                mkpart '" "' fat32 1MiB 101MiB \
+                mkpart '" "' ext4 101MiB $boot_part_size \
+                mkpart '" "' $fs $boot_part_size -$installer_part_size \
+                mkpart '" "' ext4 -$installer_part_size 100% \
+                set 1 esp on \
+                set 2 raid on \
+                set 3 raid on
+        else
+            parted "/dev/$disk" -s -- \
+                mklabel gpt \
+                mkpart '" "' ext4 1MiB 2MiB \
+                mkpart '" "' ext4 2MiB $boot_part_size \
+                mkpart '" "' $fs $boot_part_size -$installer_part_size \
+                mkpart '" "' ext4 -$installer_part_size 100% \
+                set 1 bios_grub on \
+                set 2 raid on \
+                set 3 raid on
+        fi
+    done
+    update_part_raid_disks
+    if is_efi; then
+        for disk in $raid_disk_names; do
+            mkfs.fat -n efi "/dev/$(disk_part "$disk" 1)"
+        done
+    fi
+    set_raid_part_arrays
+    # shellcheck disable=SC2086
+    wipefs -a -f $raid_boot_part_array $raid_root_part_array
+    apk del wipefs
+
+    mkdir -p /dev/md
+    raid_disk_count=$(echo "$raid_disk_names" | wc -w)
+    # shellcheck disable=SC2086
+    mdadm --create /dev/md/boot --run --force --metadata=1.0 --name=boot --level=1 --raid-devices="$raid_disk_count" $raid_boot_part_array
+    # shellcheck disable=SC2086
+    mdadm --create /dev/md/root --run --force --metadata=1.2 --name=root --level="$raid_level" --raid-devices="$raid_disk_count" $raid_root_part_array
+
+    mkfs.ext4 -F -L boot /dev/md/boot
+    mkfs.ext4 -F -L installer "/dev/$(disk_part "$raid_installer_disk" 4)"
+}
+
 create_part() {
     # 除了 dd 都会用到
     info "Create Part"
+
+    if is_use_raid; then
+        create_ubuntu_raid_part
+        return
+    fi
 
     # 分区工具
     apk add parted e2fsprogs
     if is_efi; then
         apk add dosfstools
+    fi
+    if [ "$fs_type" = xfs ]; then
+        apk add xfsprogs
     fi
 
     # 清除分区表
@@ -3045,7 +3700,7 @@ create_part() {
             update_part
 
             mkfs.fat "/dev/$(xda 1)"                #1 efi
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)" #2 os + installer
+            format_root_partition "/dev/$(xda 2)" '' "$ext4_opts" #2 os + installer
         elif is_xda_gt_2t; then
             # bios > 2t
             # 官方安装器是 mkpart BOOT 1M 100M，无论 esp 或者 bios_grub 都用这个分区和大小
@@ -3057,7 +3712,7 @@ create_part() {
             update_part
 
             echo                                    #1 bios_boot
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)" #2 os + installer
+            format_root_partition "/dev/$(xda 2)" '' "$ext4_opts" #2 os + installer
         else
             # bios
             parted /dev/$xda -s -- \
@@ -3068,7 +3723,7 @@ create_part() {
             update_part
 
             echo                                    #1 官方安装有这个分区
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)" #2 os + installer
+            format_root_partition "/dev/$(xda 2)" '' "$ext4_opts" #2 os + installer
         fi
     elif is_use_cloud_image; then
         installer_part_size="$(get_cloud_image_part_size)"
@@ -3078,7 +3733,7 @@ create_part() {
             [ "$distro" = anolis ] || [ "$distro" = opencloudos ] || [ "$distro" = openeuler ] ||
             [ "$distro" = ubuntu ]; then
             # 这里的 fs 没有用，最终使用目标系统的格式化工具
-            fs=ext4
+            fs=$(get_root_fs_type)
             if is_efi; then
                 parted /dev/$xda -s -- \
                     mklabel gpt \
@@ -3118,6 +3773,7 @@ create_part() {
         fi
     elif [ "$distro" = alpine ] || [ "$distro" = arch ] || [ "$distro" = gentoo ] ||
         [ "$distro" = nixos ] || [ "$distro" = aosc ]; then
+        root_fs=$(get_root_fs_type)
         # alpine 本身关闭了 64bit ext4
         # https://gitlab.alpinelinux.org/alpine/alpine-conf/-/blob/3.18.1/setup-disk.in?ref_type=tags#L908
         # 而且 alpine 的 extlinux 不兼容 64bit ext4
@@ -3127,32 +3783,32 @@ create_part() {
             parted /dev/$xda -s -- \
                 mklabel gpt \
                 mkpart '" "' fat32 1MiB 101MiB \
-                mkpart '" "' ext4 101MiB 100% \
+                mkpart '" "' $root_fs 101MiB 100% \
                 set 1 boot on
             update_part
 
             mkfs.fat "/dev/$(xda 1)"                #1 efi
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)" #2 os
+            format_root_partition "/dev/$(xda 2)" '' "$ext4_opts" #2 os
         elif is_xda_gt_2t; then
             # bios > 2t
             parted /dev/$xda -s -- \
                 mklabel gpt \
                 mkpart '" "' ext4 1MiB 2MiB \
-                mkpart '" "' ext4 2MiB 100% \
+                mkpart '" "' $root_fs 2MiB 100% \
                 set 1 bios_grub on
             update_part
 
             echo                                    #1 bios_boot
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)" #2 os
+            format_root_partition "/dev/$(xda 2)" '' "$ext4_opts" #2 os
         else
             # bios
             parted /dev/$xda -s -- \
                 mklabel msdos \
-                mkpart primary ext4 1MiB 100% \
+                mkpart primary $root_fs 1MiB 100% \
                 set 1 boot on
             update_part
 
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 1)" #1 os
+            format_root_partition "/dev/$(xda 1)" '' "$ext4_opts" #1 os
         fi
     else
         # 安装红帽系或ubuntu
@@ -4853,7 +5509,7 @@ download_qcow() {
     info "Download qcow2 image"
 
     mkdir -p /installer
-    mount /dev/disk/by-label/installer /installer
+    mount "$(installer_dev)" /installer
 
     qcow_file=/installer/cloud_image.qcow2
     if [ -n "$img_type_warp" ]; then
@@ -5004,6 +5660,37 @@ chroot_apt_install() {
         chroot_apt_update $os_dir
         DEBIAN_FRONTEND=noninteractive chroot $os_dir apt-get install -y $pkgs
     fi
+}
+
+chroot_pkg_install() {
+    local os_dir=$1
+    local pkg_mgr ret
+    shift
+
+    for pkg_mgr in apt-get dnf yum zypper; do
+        if is_have_cmd_on_disk "$os_dir" "$pkg_mgr"; then
+            cp_resolv_conf "$os_dir"
+            set +e
+            case "$pkg_mgr" in
+            apt-get)
+                chroot_apt_update "$os_dir" || true
+                DEBIAN_FRONTEND=noninteractive chroot "$os_dir" apt-get install -y "$@"
+                ;;
+            dnf | yum)
+                chroot "$os_dir" "$pkg_mgr" install -y "$@"
+                ;;
+            zypper)
+                chroot "$os_dir" zypper install -y "$@"
+                ;;
+            esac
+            ret=$?
+            set -e
+            restore_resolv_conf "$os_dir"
+            return "$ret"
+        fi
+    done
+
+    error_and_exit "Could not find a supported package manager in $os_dir."
 }
 
 chroot_apt_remove() {
@@ -5278,6 +5965,104 @@ install_fnos() {
 install_qcow_by_copy() {
     info "Install qcow2 by copy"
 
+    is_target_root_fs_changed() {
+        [ -n "$target_os_fstype" ] &&
+            [ -n "$os_part_fstype" ] &&
+            [ "$target_os_fstype" != "$os_part_fstype" ]
+    }
+
+    get_target_root_mount_options() {
+        local fstab=$1
+        local opts
+
+        if is_target_root_fs_changed; then
+            echo defaults
+            return
+        fi
+
+        opts=$(awk '$1 !~ /^#/ && $2 == "/" {print $4; exit}' "$fstab")
+        if [ -n "$opts" ]; then
+            echo "$opts"
+        else
+            echo defaults
+        fi
+    }
+
+    rewrite_root_fstab() {
+        local fstab=$1
+        local uuid=$2
+        local opts tmp normalize_fsck=0 root_pass=0
+
+        opts=$(get_target_root_mount_options "$fstab")
+        if is_target_root_fs_changed; then
+            normalize_fsck=1
+            if [ "$target_os_fstype" = ext4 ]; then
+                root_pass=1
+            fi
+        fi
+        tmp=$fstab.tmp.$$
+        awk -v source="UUID=$uuid" -v fstype="$target_os_fstype" -v opts="$opts" \
+            -v normalize_fsck="$normalize_fsck" -v root_pass="$root_pass" '
+            $1 !~ /^#/ && $2 == "/" {
+                $1 = source
+                $3 = fstype
+                $4 = opts
+                if (normalize_fsck) {
+                    $5 = 0
+                    $6 = root_pass
+                }
+            }
+            { print }
+        ' "$fstab" >"$tmp"
+        mv "$tmp" "$fstab"
+    }
+
+    ensure_chroot_root_fs_tool() {
+        local os_dir=$1
+        local root_fs=$2
+        local cmd pkg
+
+        case "$root_fs" in
+        ext4)
+            cmd=mkfs.ext4
+            pkg=e2fsprogs
+            ;;
+        xfs)
+            cmd=mkfs.xfs
+            pkg=xfsprogs
+            ;;
+        *)
+            error_and_exit "Unsupported target root fs type: $root_fs"
+            ;;
+        esac
+
+        if is_have_cmd_on_disk "$os_dir" "$cmd"; then
+            return
+        fi
+
+        info "Install $pkg in target image"
+        if ! chroot_pkg_install "$os_dir" "$pkg"; then
+            error_and_exit "Failed to install $pkg in target image."
+        fi
+
+        if ! is_have_cmd_on_disk "$os_dir" "$cmd"; then
+            error_and_exit "Failed to install $pkg in target image. $cmd is not available."
+        fi
+    }
+
+    rebuild_chroot_initramfs() {
+        local os_dir=$1
+
+        info "Rebuild initramfs"
+        if is_have_cmd_on_disk "$os_dir" update-initramfs; then
+            chroot "$os_dir" update-initramfs -u -k all
+        elif is_have_cmd_on_disk "$os_dir" dracut; then
+            chroot "$os_dir" dracut -f --regenerate-all
+        else
+            error_and_exit "Could not rebuild initramfs in $os_dir after root filesystem changes."
+        fi
+    }
+
     modify_el_ol() {
         info "Modify el ol"
         local os_dir=/os
@@ -5342,11 +6127,15 @@ install_qcow_by_copy() {
         # mapper/vg_main-lv_root
         # mapper/opencloudos-root
 
+        # 修正根分区的格式和 uuid (可能原镜像为 lvm / ext4 / xfs / 甚至是 LABEL 挂载)
+        os_fs_uuid=$(lsblk -rno UUID "/dev/$(xda 2)")
+        rewrite_root_fstab /os/etc/fstab "$os_fs_uuid"
+
         # oracle/opencloudos 系统盘从 lvm 改成 uuid 挂载
-        sed -i "s,/dev/$os_part,UUID=$os_part_uuid," /os/etc/fstab
+        sed -i "s,/dev/$os_part,UUID=$os_fs_uuid," /os/etc/fstab
         if ls /os/boot/loader/entries/*.conf 2>/dev/null; then
             # options root=/dev/mapper/opencloudos-root ro console=ttyS0,115200n8 no_timer_check net.ifnames=0 crashkernel=1800M-64G:256M,64G-128G:512M,128G-486G:768M,486G-972G:1024M,972G-:2048M rd.lvm.lv=opencloudos/root rhgb quiet
-            sed -i "s,/dev/$os_part,UUID=$os_part_uuid," /os/boot/loader/entries/*.conf
+            sed -i "s,/dev/$os_part,UUID=$os_fs_uuid," /os/boot/loader/entries/*.conf
         fi
 
         # oracle/opencloudos 移除 lvm cmdline
@@ -5364,6 +6153,10 @@ install_qcow_by_copy() {
         else
             # 删除 efi 条目
             sed -i '/[[:space:]]\/boot\/efi[[:space:]]/d' /os/etc/fstab
+        fi
+
+        if is_target_root_fs_changed; then
+            rebuild_chroot_initramfs "$os_dir"
         fi
 
         remove_grub_conflict_files() {
@@ -5578,6 +6371,194 @@ EOF
         rm_resolv_conf /os
     }
 
+    fix_ubuntu_efi_grub_cfg() {
+        local os_dir=$1
+        local efi_grub_cfg os_uuid
+
+        if ! is_efi; then
+            return
+        fi
+
+        efi_grub_cfg=$os_dir/boot/efi/EFI/ubuntu/grub.cfg
+        if ! [ -f "$efi_grub_cfg" ]; then
+            error_and_exit "Ubuntu EFI grub.cfg not found: $efi_grub_cfg"
+        fi
+
+        if is_use_raid; then
+            os_uuid=$(lsblk -rno UUID "$(boot_dev)")
+        else
+            os_uuid=$(lsblk -rno UUID "/dev/$(xda 2)")
+        fi
+        sed -Ei "s|[0-9a-f-]{36}|$os_uuid|i" $efi_grub_cfg
+
+        if is_use_raid; then
+            # 独立 /boot 阵列内的 grub 目录位于阵列根目录
+            sed -i "s|'/boot/grub'|'/grub'|" $efi_grub_cfg
+        elif grep "'/grub'" $efi_grub_cfg; then
+            # 24.04 移除 boot 分区后，需要添加 /boot 路径
+            sed -i "s|'/grub'|'/boot/grub'|" $efi_grub_cfg
+        fi
+    }
+
+    configure_ubuntu_raid_mdadm() {
+        local os_dir=$1
+        local initramfs_mdadm_conf=$os_dir/etc/initramfs-tools/conf.d/mdadm
+        local default_mdadm_conf=$os_dir/etc/default/mdadm
+
+        echo mdadm mdadm/initrdstart string all | chroot $os_dir debconf-set-selections
+        echo mdadm mdadm/boot_degraded boolean true | chroot $os_dir debconf-set-selections
+        chroot_apt_install $os_dir mdadm
+
+        mkdir -p $os_dir/etc/mdadm
+        chroot $os_dir mdadm --detail --scan >$os_dir/etc/mdadm/mdadm.conf
+
+        mkdir -p "$(dirname "$initramfs_mdadm_conf")"
+        touch "$initramfs_mdadm_conf"
+        if grep -q '^BOOT_DEGRADED=' "$initramfs_mdadm_conf"; then
+            sed -i 's/^BOOT_DEGRADED=.*/BOOT_DEGRADED=true/' "$initramfs_mdadm_conf"
+        else
+            echo BOOT_DEGRADED=true >>"$initramfs_mdadm_conf"
+        fi
+
+        mkdir -p "$(dirname "$default_mdadm_conf")"
+        touch "$default_mdadm_conf"
+        if grep -q '^BOOT_DEGRADED=' "$default_mdadm_conf"; then
+            sed -i 's/^BOOT_DEGRADED=.*/BOOT_DEGRADED=true/' "$default_mdadm_conf"
+        else
+            echo BOOT_DEGRADED=true >>"$default_mdadm_conf"
+        fi
+    }
+
+    get_raid_efi_uuids() {
+        local disk uuid uuids
+
+        uuids=
+        for disk in $raid_disk_names; do
+            uuid=$(lsblk -rno UUID "$(efi_dev "$disk")" | head -n1)
+            if [ -z "$uuid" ]; then
+                error_and_exit "Could not get EFI UUID for RAID disk: $disk"
+            fi
+            [ -n "$uuids" ] && uuids="$uuids "
+            uuids="$uuids$uuid"
+        done
+        echo "$uuids"
+    }
+
+    get_raid_primary_efi_uuid() {
+        get_raid_efi_uuids | awk '{print $1}'
+    }
+
+    install_raid_efi_sync_hooks() {
+        local os_dir=$1
+        local esp_uuids script service hook
+
+        if ! is_efi; then
+            return
+        fi
+
+        esp_uuids=$(get_raid_efi_uuids)
+        script=$os_dir/usr/local/sbin/sync-raid-efi
+        mkdir -p "$(dirname "$script")"
+        cat >"$script" <<EOF
+#!/bin/sh
+set -eu
+
+ESP_UUIDS='$esp_uuids'
+EOF
+        cat >>"$script" <<'EOF'
+MOUNT_POINT=/boot/efi
+SYNC_DIR=/mnt/raid-efi-sync
+
+copy_esp_tree() {
+    src=$1
+    dst=$2
+
+    find "$dst" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    cp -R "$src"/. "$dst"/
+}
+
+cleanup() {
+    if mountpoint -q "$SYNC_DIR" 2>/dev/null; then
+        umount "$SYNC_DIR"
+    fi
+}
+
+trap cleanup EXIT INT TERM
+
+mkdir -p "$MOUNT_POINT"
+if ! mountpoint -q "$MOUNT_POINT"; then
+    for uuid in $ESP_UUIDS; do
+        dev=/dev/disk/by-uuid/$uuid
+        if [ -e "$dev" ] && mount "$dev" "$MOUNT_POINT"; then
+            break
+        fi
+    done
+fi
+
+mountpoint -q "$MOUNT_POINT" || exit 0
+
+source_dev=$(findmnt -n -o SOURCE --target "$MOUNT_POINT" 2>/dev/null | head -n1 || true)
+source_dev=$(readlink -f "$source_dev" 2>/dev/null || true)
+[ -n "$source_dev" ] || exit 0
+
+mkdir -p "$SYNC_DIR"
+for uuid in $ESP_UUIDS; do
+    dev=/dev/disk/by-uuid/$uuid
+    [ -e "$dev" ] || continue
+
+    dev_path=$(readlink -f "$dev" 2>/dev/null || true)
+    [ -n "$dev_path" ] || continue
+    [ "$dev_path" = "$source_dev" ] && continue
+
+    if mount "$dev_path" "$SYNC_DIR"; then
+        copy_esp_tree "$MOUNT_POINT" "$SYNC_DIR"
+        sync
+        umount "$SYNC_DIR"
+    fi
+done
+
+rmdir "$SYNC_DIR" 2>/dev/null || true
+EOF
+        chmod +x "$script"
+
+        mkdir -p $os_dir/etc/apt/apt.conf.d
+        cat >$os_dir/etc/apt/apt.conf.d/99-sync-raid-efi <<'EOF'
+DPkg::Pre-Invoke { "if [ -x /usr/local/sbin/sync-raid-efi ]; then /usr/local/sbin/sync-raid-efi || true; fi"; };
+DPkg::Post-Invoke { "if [ -x /usr/local/sbin/sync-raid-efi ]; then /usr/local/sbin/sync-raid-efi || true; fi"; };
+EOF
+
+        service=$os_dir/etc/systemd/system/sync-raid-efi.service
+        mkdir -p "$(dirname "$service")"
+        cat >"$service" <<'EOF'
+[Unit]
+Description=Mount and synchronize redundant EFI system partitions
+After=local-fs.target
+Before=apt-daily.service apt-daily-upgrade.service
+ConditionPathIsExecutable=/usr/local/sbin/sync-raid-efi
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sync-raid-efi
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        mkdir -p "$os_dir/etc/systemd/system/multi-user.target.wants"
+        ln -sf ../sync-raid-efi.service \
+            "$os_dir/etc/systemd/system/multi-user.target.wants/sync-raid-efi.service"
+
+        for hook in postinst.d postrm.d; do
+            mkdir -p "$os_dir/etc/kernel/$hook"
+            cat >"$os_dir/etc/kernel/$hook/zz-sync-raid-efi" <<'EOF'
+#!/bin/sh
+if [ -x /usr/local/sbin/sync-raid-efi ]; then
+    /usr/local/sbin/sync-raid-efi || true
+fi
+EOF
+            chmod +x "$os_dir/etc/kernel/$hook/zz-sync-raid-efi"
+        done
+    }
+
     modify_ubuntu() {
         local os_dir=/os
         info "Modify Ubuntu"
@@ -5609,7 +6590,9 @@ EOF
 
         # 安装 mbr
         if ! is_efi; then
-            if false; then
+            if is_use_raid; then
+                :
+            elif false; then
                 # debconf-show grub-pc
                 # 每次开机硬盘名字可能不一样，但是 debian netboot 安装后也是设置了 grub-pc/install_devices
                 echo grub-pc grub-pc/install_devices multiselect /dev/$xda | chroot $os_dir debconf-set-selections # 22.04
@@ -5646,6 +6629,10 @@ EOF
 
         # 该方法包含了 apt-mark manual
         chroot_apt_install $os_dir "linux-image-$flavor"
+
+        if is_use_raid; then
+            configure_ubuntu_raid_mdadm "$os_dir"
+        fi
 
         # 使用 autoremove 删除多余内核
         chroot_apt_autoremove $os_dir
@@ -5697,23 +6684,15 @@ EOF
             fi
         fi
 
-        # 更改 efi 目录的 grub.cfg 写死的 fsuuid
-        # 因为 24.04 fsuuid 对应 boot 分区
-        efi_grub_cfg=$os_dir/boot/efi/EFI/ubuntu/grub.cfg
-        if is_efi; then
-            os_uuid=$(lsblk -rno UUID "/dev/$(xda 2)")
-            sed -Ei "s|[0-9a-f-]{36}|$os_uuid|i" $efi_grub_cfg
-
-            # 24.04 移除 boot 分区后，需要添加 /boot 路径
-            if grep "'/grub'" $efi_grub_cfg; then
-                sed -i "s|'/grub'|'/boot/grub'|" $efi_grub_cfg
-            fi
-        fi
+        # 更改 efi 目录的 grub.cfg 写死的 fsuuid；24.04 fsuuid 对应 boot 分区
+        fix_ubuntu_efi_grub_cfg "$os_dir"
 
         # 处理 40-force-partuuid.cfg
         force_partuuid_cfg=$os_dir/etc/default/grub.d/40-force-partuuid.cfg
         if [ -e $force_partuuid_cfg ]; then
-            if is_virt; then
+            if is_use_raid; then
+                sed -i "/^GRUB_FORCE_PARTUUID=/d" $force_partuuid_cfg
+            elif is_virt; then
                 # 更改写死的 partuuid
                 os_part_uuid=$(lsblk -rno PARTUUID "/dev/$(xda 2)")
                 sed -i "s/^GRUB_FORCE_PARTUUID=.*/GRUB_FORCE_PARTUUID=$os_part_uuid/" $force_partuuid_cfg
@@ -5723,21 +6702,50 @@ EOF
             fi
         fi
 
+        # fstab
+        # 修正根分区的格式和 uuid (原镜像可能是 ext4 或者是 LABEL 挂载)
+        os_fs_uuid=$(lsblk -rno UUID "$(root_dev)")
+        rewrite_root_fstab "$os_dir/etc/fstab" "$os_fs_uuid"
+        # 24.04 镜像有boot分区，但我们不需要
+        sed -i '/[[:space:]]\/boot[[:space:]]/d' $os_dir/etc/fstab
+        if is_use_raid; then
+            boot_fs_uuid=$(lsblk -rno UUID "$(boot_dev)")
+            sed -i '/[[:space:]]\/boot\/efi[[:space:]]/d' $os_dir/etc/fstab
+            echo "UUID=$boot_fs_uuid /boot ext4 defaults 0 2" >>$os_dir/etc/fstab
+        fi
+        if ! is_efi; then
+            # bios 删除 efi 条目
+            sed -i '/[[:space:]]\/boot\/efi[[:space:]]/d' $os_dir/etc/fstab
+        elif is_use_raid; then
+            install_raid_efi_sync_hooks "$os_dir"
+            efi_part_uuid=$(get_raid_primary_efi_uuid)
+            echo "UUID=$efi_part_uuid /boot/efi vfat $efi_mount_opts,nofail 0 0" >>$os_dir/etc/fstab
+        fi
+
+        if is_use_raid || is_target_root_fs_changed; then
+            rebuild_chroot_initramfs "$os_dir"
+        fi
+
         # 要重新生成 grub.cfg，因为
         # 1 我们删除了 boot 分区
         # 2 改动了 /etc/default/grub.d/40-force-partuuid.cfg
         chroot $os_dir update-grub
 
+        if is_use_raid; then
+            if is_efi; then
+                chroot $os_dir grub-install --efi-directory=/boot/efi
+                chroot $os_dir grub-install --efi-directory=/boot/efi --removable
+                fix_ubuntu_efi_grub_cfg "$os_dir"
+                sync_efi_to_raid_members
+            else
+                for disk in $raid_disk_names; do
+                    chroot $os_dir grub-install "/dev/$disk"
+                done
+            fi
+        fi
+
         # 还原 grub 配置（os prober）
         mv $os_dir/etc/default/grub.orig $os_dir/etc/default/grub
-
-        # fstab
-        # 24.04 镜像有boot分区，但我们不需要
-        sed -i '/[[:space:]]\/boot[[:space:]]/d' $os_dir/etc/fstab
-        if ! is_efi; then
-            # bios 删除 efi 条目
-            sed -i '/[[:space:]]\/boot\/efi[[:space:]]/d' $os_dir/etc/fstab
-        fi
 
         restore_resolv_conf $os_dir
     }
@@ -5866,9 +6874,34 @@ EOF
     # centos8 如果用alpine格式化xfs，grub2-mkconfig和grub2里面都无法识别xfs分区
     mount_nouuid /dev/$os_part /nbd/
     mount_pseudo_fs /nbd/
-    case "$os_part_fstype" in
-    ext4) chroot /nbd mkfs.ext4 -F -L "$os_part_label" -U "$os_part_uuid" "/dev/$(xda 2)" ;;
-    xfs) chroot /nbd mkfs.xfs -f -L "$os_part_label" -m uuid=$os_part_uuid "/dev/$(xda 2)" ;;
+    if [ -n "$fs_type" ] && [ "$fs_type" != default ]; then
+        target_os_fstype=$fs_type
+    else
+        target_os_fstype=$os_part_fstype
+    fi
+    # shellcheck disable=SC2086
+    case "$target_os_fstype" in
+    ext4)
+        ensure_chroot_root_fs_tool /nbd ext4
+        if [ -n "$os_part_label" ]; then
+            chroot /nbd mkfs.ext4 -F $fs_options -L "$os_part_label" -U "$os_part_uuid" "$(root_dev)"
+        else
+            chroot /nbd mkfs.ext4 -F $fs_options -U "$os_part_uuid" "$(root_dev)"
+        fi
+        ;;
+    xfs)
+        ensure_chroot_root_fs_tool /nbd xfs
+        # XFS limit label to 12 chars
+        mkfs_label=$(printf '%.12s' "$os_part_label")
+        if [ -n "$mkfs_label" ]; then
+            chroot /nbd mkfs.xfs -f $fs_options -L "$mkfs_label" -m uuid=$os_part_uuid "$(root_dev)"
+        else
+            chroot /nbd mkfs.xfs -f $fs_options -m uuid=$os_part_uuid "$(root_dev)"
+        fi
+        ;;
+    *)
+        error_and_exit "Unsupported target root fs type: $target_os_fstype"
+        ;;
     esac
     umount -R /nbd/
 
@@ -5876,7 +6909,8 @@ EOF
 
     # 创建并挂载 /os
     mkdir -p /os
-    mount -o noatime "/dev/$(xda 2)" /os/
+    mount -o noatime "$(root_dev)" /os/
+    mount_target_boot_if_raid
 
     # 如果是 efi 则创建 /os/boot/efi
     # 如果镜像有 efi 分区也创建 /os/boot/efi，用于复制 efi 分区的文件
@@ -5887,7 +6921,7 @@ EOF
         # 预先挂载 /os/boot/efi 因为可能 boot 和 efi 在同一个分区（openeuler 24.03 arm）
         # 复制 boot 时可以会复制 efi 的文件
         if is_efi; then
-            mount -o $efi_mount_opts "/dev/$(xda 1)" /os/boot/efi/
+            mount -o $efi_mount_opts "$(efi_dev)" /os/boot/efi/
         fi
     fi
 
@@ -5925,9 +6959,7 @@ EOF
 
     # 取消挂载硬盘
     info "Unmounting disk"
-    if is_efi; then
-        umount /os/boot/efi/
-    fi
+    umount_target_boots
     umount /os/
     umount /installer/
 
@@ -5938,23 +6970,35 @@ EOF
     if is_efi && [ -n "$efi_part_uuid" ] && ! [ "$efi_part" = "$os_part" ]; then
         info "Copy efi partition uuid"
         apk add mtools
-        mlabel -N "$(echo $efi_part_uuid | sed 's/-//')" -i "/dev/$(xda 1)" ::$efi_part_label
+        mlabel -N "$(echo $efi_part_uuid | sed 's/-//')" -i "$(efi_dev)" ::$efi_part_label
         apk del mtools
-        update_part
+        if is_use_raid; then
+            update_part_raid_disks
+        else
+            update_part
+        fi
     fi
 
     # 删除 installer 分区并扩容
     info "Delete installer partition"
-    apk add parted
-    parted /dev/$xda -s -- rm 3
-    update_part
-    resize_after_install_cloud_image
+    if is_use_raid; then
+        resize_after_install_raid_cloud_image
+    else
+        apk add parted
+        parted /dev/$xda -s -- rm 3
+        update_part
+        resize_after_install_cloud_image
+    fi
 
     # 重新挂载 /os /boot/efi
     info "Re-mount disk"
-    mount -o noatime "/dev/$(xda 2)" /os/
-    if is_efi; then
-        mount -o $efi_mount_opts "/dev/$(xda 1)" /os/boot/efi/
+    mount -o noatime "$(root_dev)" /os/
+    mount_target_boot_if_raid
+    mount_target_efi_if_need
+    if is_use_raid && is_raid_root_size_grow_supported && [ "$target_os_fstype" = xfs ]; then
+        apk add xfsprogs-extra
+        xfs_growfs /os
+        apk del xfsprogs-extra
     fi
 
     # 创建 swap
@@ -6182,7 +7226,8 @@ resize_after_install_cloud_image() {
             # opensuse ci
             apk add xfsprogs-extra
             mount "/dev/$(xda $last_part_num)" /os
-            xfs_growfs "/dev/$(xda $last_part_num)"
+            # xfs_growfs grows a mounted filesystem and expects its mount point.
+            xfs_growfs /os
             umount /os
             apk del xfsprogs-extra
             ;;
@@ -6207,9 +7252,97 @@ resize_after_install_cloud_image() {
     fi
 }
 
+mount_target_boot_if_raid() {
+    if ! is_use_raid; then
+        return
+    fi
+
+    mkdir -p /os/boot
+    mount -o noatime "$(boot_dev)" /os/boot
+}
+
+mount_target_efi_if_need() {
+    if is_efi; then
+        mkdir -p /os/boot/efi
+        mount -o $efi_mount_opts "$(efi_dev)" /os/boot/efi
+    fi
+}
+
+umount_target_boots() {
+    if is_efi && mount | grep -wq 'on /os/boot/efi'; then
+        umount /os/boot/efi
+    fi
+    if is_use_raid && mount | grep -wq 'on /os/boot'; then
+        umount /os/boot
+    fi
+}
+
+sync_efi_to_raid_members() {
+    local disk src
+
+    if ! is_use_raid || ! is_efi; then
+        return
+    fi
+
+    src=$raid_installer_disk
+    mkdir -p /mnt/efi-sync
+    for disk in $raid_disk_names; do
+        [ "$disk" = "$src" ] && continue
+        mount "$(efi_dev "$disk")" /mnt/efi-sync
+        find /mnt/efi-sync -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+        cp -R /os/boot/efi/. /mnt/efi-sync/
+        umount /mnt/efi-sync
+    done
+    rmdir /mnt/efi-sync
+}
+
+resize_after_install_raid_cloud_image() {
+    local disk root_fs e2fsck_status
+
+    info "Resize RAID after install"
+
+    apk add parted mdadm
+
+    stop_md_arrays
+    for disk in $raid_disk_names; do
+        parted "/dev/$disk" -s -- rm 4
+        printf "yes" | parted "/dev/$disk" resizepart 3 100% ---pretend-input-tty
+    done
+    update_part_raid_disks
+    refresh_raid_arrays
+
+    if ! is_raid_root_size_grow_supported; then
+        warn "RAID level $raid_level Safe v1 skips root array growth; space formerly reserved for the installer is not added to the root array/filesystem."
+        return
+    fi
+
+    mdadm --grow /dev/md/root --size=max
+    root_fs=${target_os_fstype:-$(get_root_fs_type)}
+    case "$root_fs" in
+    ext4)
+        apk add e2fsprogs-extra
+        set +e
+        e2fsck -p -f /dev/md/root
+        e2fsck_status=$?
+        set -e
+        case "$e2fsck_status" in
+        0 | 1) ;;
+        *) error_and_exit "Filesystem check failed for /dev/md/root before resize: e2fsck exit $e2fsck_status" ;;
+        esac
+        resize2fs /dev/md/root
+        apk del e2fsprogs-extra
+        ;;
+    xfs)
+        # XFS grows after /os is remounted below.
+        :
+        ;;
+    esac
+}
+
 mount_part_basic_layout() {
     local os_dir=$1
     local efi_dir=$2
+    local os_part_num root_fs
 
     if is_efi || is_xda_gt_2t; then
         os_part_num=2
@@ -6218,8 +7351,9 @@ mount_part_basic_layout() {
     fi
 
     # 挂载系统分区
+    root_fs=$(get_root_fs_type)
     mkdir -p $os_dir
-    mount -t ext4 "/dev/$(xda $os_part_num)" $os_dir
+    mount -t "$root_fs" "/dev/$(xda $os_part_num)" $os_dir
 
     # 挂载 efi 分区
     if is_efi; then
@@ -8584,7 +9718,9 @@ trans() {
     # 需要在重新分区之前，找到主硬盘
     # 重新运行脚本时，可指定 xda
     # xda=sda ash trans.start
-    if [ -z "$xda" ]; then
+    if is_use_raid; then
+        resolve_raid_disks
+    elif [ -z "$xda" ]; then
         find_xda
     fi
 
@@ -8719,6 +9855,8 @@ rm -f /etc/runlevels/default/local
 
 # 提取变量
 extract_env_from_cmdline
+load_fs_config
+load_raid_config
 
 # 带参数运行部分
 # 重新下载并 exec 运行新脚本
@@ -8733,9 +9871,16 @@ elif [ "$1" = "alpine" ]; then
     distro=alpine
     # 后面的步骤很多都会用到这个，例如分区布局
     cloud_image=0
+    # RAID 分区后原磁盘 PTUUID 已失效；从解析后保存的设备名中选择仍存在的磁盘。
+    xda=$(get_usable_rescue_disk || true)
+    unset fs_type fs_options
+    unset raid_level raid_disks raid_disk_names raid_installer_disk
 elif [ -n "$1" ]; then
     error_and_exit "unknown option $1"
 fi
+
+verify_fs_runtime_config
+verify_raid_runtime_config
 
 # 无参数运行部分
 # 允许 ramdisk 使用所有内存，默认是 50%

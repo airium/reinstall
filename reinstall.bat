@@ -2,7 +2,7 @@
 mode con cp select=437 >nul
 setlocal EnableDelayedExpansion
 
-set confhome=https://raw.githubusercontent.com/bin456789/reinstall/main
+set confhome=https://raw.githubusercontent.com/airium/reinstall/main
 set confhome_cn=https://cnb.cool/bin456789/reinstall/-/git/raw/main
 rem set confhome_cn=https://www.ghproxy.cc/https://raw.githubusercontent.com/bin456789/reinstall/main
 
